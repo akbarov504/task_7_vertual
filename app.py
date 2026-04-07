@@ -45,37 +45,33 @@ def build_ffmpeg_command(
         "-nostdin",
         "-hide_banner",
         "-loglevel", "warning",
-        
-        # --- PHASE 1: INPUT OPTIMIZATION ---
-        "-fflags", "nobuffer+genpts", # Prevent input buffering
-        "-flags", "low_delay",        # Tell FFmpeg to prioritize speed
-        "-probesize", "32",           # Analyze less data at start to reduce startup lag
-        "-analyzeduration", "0",
-        
-        "-thread_queue_size", "1024",
+        "-fflags", "+genpts",
+
+        "-thread_queue_size", "2048",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
 
-        "-thread_queue_size", "1024",
+        "-thread_queue_size", "2048",
         "-f", "alsa",
         "-channels", channels,
         "-sample_rate", sample_rate,
         "-i", audio_device,
+
+        "-max_muxing_queue_size", "1024",
     ]
 
-    # --- PHASE 2: FILE RECORDING (Hardware) ---
     cmd += [
         "-map", "0:v:0",
         "-map", "1:a:0",
+
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
-        "-g", str(FPS),               # Reduced GOP to 1 second for faster recovery
+        "-g", str(FPS * 2),
         "-maxrate", "1800k",
-        "-bufsize", "1800k", 
-        
+        "-bufsize", "3600k",
         "-c:a", "aac",
         "-b:a", "64k",
         "-af", "aresample=async=1",
@@ -88,19 +84,14 @@ def build_ffmpeg_command(
         timestamp_pattern,
     ]
 
-    # --- PHASE 3: VIRTUAL PORT (The Delay Fixer) ---
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
             "-an",
-            # Optimization: Scale first, then drop FPS to 15 immediately to save CPU
-            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=lanczos,format=yuyv422",
-            "-c:v", "rawvideo",
+            "-vf", f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT},fps={VIRTUAL_FPS},format=yuyv422",
+            "-c:v", "h264_rkmpp",
             "-pix_fmt", "yuyv422",
             "-f", "v4l2",
-            # This allows the virtual port to "drop frames" if it can't keep up
-            # preventing the 5-second delay from building up.
-            "-timestamp", "now",
             virtual_video_device,
         ]
 
