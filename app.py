@@ -94,9 +94,9 @@ def build_ffmpeg_command(
             "-map", "0:v:0",
             "-an",
             # Optimization: Scale first, then drop FPS to 15 immediately to save CPU
-            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=lanczos,format=yuv420p",
+            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=lanczos,format=yuyv422",
             "-c:v", "rawvideo",
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", "yuyv422",
             "-f", "v4l2",
             # This allows the virtual port to "drop frames" if it can't keep up
             # preventing the 5-second delay from building up.
