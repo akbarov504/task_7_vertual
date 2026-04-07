@@ -53,11 +53,6 @@ def build_ffmpeg_command(
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
-        "-preset", "veryfast",
-        "-crf", "32",
-        "-g", str(FPS * 2),
-        "-maxrate", "1800k",
-        "-bufsize", "3600k",
 
         "-thread_queue_size", "2048",
         "-f", "alsa",
@@ -73,6 +68,11 @@ def build_ffmpeg_command(
         "-map", "1:a:0",
 
         "-c:v", "libx264",
+        "-crf", "32",
+        "-g", str(FPS * 2),
+        "-maxrate", "1800k",
+        "-bufsize", "3600k",
+        "-preset", "veryfast",
         "-c:a", "aac",
         "-b:a", "64k",
         "-af", "aresample=async=1",
