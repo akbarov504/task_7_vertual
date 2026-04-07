@@ -74,8 +74,7 @@ def build_ffmpeg_command(
         "-b:v", "1800k",
         "-g", str(FPS),               # Reduced GOP to 1 second for faster recovery
         "-maxrate", "1800k",
-        "-bufsize", "1800k",          # Tight buffer for low latency
-        "-rc_mode", "vbr",
+        "-bufsize", "1800k", 
         
         "-c:a", "aac",
         "-b:a", "64k",
