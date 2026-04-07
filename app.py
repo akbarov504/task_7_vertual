@@ -45,7 +45,10 @@ def build_ffmpeg_command(
         "-nostdin",
         "-hide_banner",
         "-loglevel", "warning",
-        "-fflags", "+genpts",
+        "-fflags", "nobuffer+genpts",
+        "-flags", "low_delay",
+        "-probesize", "32",
+        "-analyzeduration", "0",
 
         "-thread_queue_size", "2048",
         "-f", "v4l2",
@@ -88,10 +91,11 @@ def build_ffmpeg_command(
         cmd += [
             "-map", "0:v:0",
             "-an",
-            "-vf", f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT},fps={VIRTUAL_FPS},format=yuyv422",
-            "-c:v", "h264_rkmpp",
+            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=lanczos,format=yuyv422",
+            "-c:v", "rawvideo",
             "-pix_fmt", "yuyv422",
             "-f", "v4l2",
+            "-timestamp", "now",
             virtual_video_device,
         ]
 
