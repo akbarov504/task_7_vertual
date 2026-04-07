@@ -89,7 +89,7 @@ def build_ffmpeg_command(
             "-map", "0:v:0",
             "-an",
             "-vf", f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT},fps={VIRTUAL_FPS},format=yuv420p",
-            "-c:v", "copy",
+            "-c:v", "h264_rkmpp",
             "-pix_fmt", "yuv420p",
             "-f", "v4l2",
             virtual_video_device,
