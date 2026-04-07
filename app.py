@@ -45,33 +45,38 @@ def build_ffmpeg_command(
         "-nostdin",
         "-hide_banner",
         "-loglevel", "warning",
-        "-fflags", "+genpts",
-
-        "-thread_queue_size", "2048",
+        
+        # --- PHASE 1: INPUT OPTIMIZATION ---
+        "-fflags", "nobuffer+genpts", # Prevent input buffering
+        "-flags", "low_delay",        # Tell FFmpeg to prioritize speed
+        "-probesize", "32",           # Analyze less data at start to reduce startup lag
+        "-analyzeduration", "0",
+        
+        "-thread_queue_size", "1024",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
 
-        "-thread_queue_size", "2048",
+        "-thread_queue_size", "1024",
         "-f", "alsa",
         "-channels", channels,
         "-sample_rate", sample_rate,
         "-i", audio_device,
-
-        "-max_muxing_queue_size", "1024",
     ]
 
+    # --- PHASE 2: FILE RECORDING (Hardware) ---
     cmd += [
         "-map", "0:v:0",
         "-map", "1:a:0",
-
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
-        "-g", str(FPS * 2),
+        "-g", str(FPS),               # Reduced GOP to 1 second for faster recovery
         "-maxrate", "1800k",
-        "-bufsize", "3600k",
+        "-bufsize", "1800k",          # Tight buffer for low latency
+        "-rc_mode", "vbr",
+        
         "-c:a", "aac",
         "-b:a", "64k",
         "-af", "aresample=async=1",
@@ -84,14 +89,19 @@ def build_ffmpeg_command(
         timestamp_pattern,
     ]
 
+    # --- PHASE 3: VIRTUAL PORT (The Delay Fixer) ---
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
             "-an",
-            "-vf", f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT},fps={VIRTUAL_FPS},format=yuv420p",
-            "-c:v", "h264_rkmpp",
+            # Optimization: Scale first, then drop FPS to 15 immediately to save CPU
+            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=lanczos,format=yuv420p",
+            "-c:v", "rawvideo",
             "-pix_fmt", "yuv420p",
             "-f", "v4l2",
+            # This allows the virtual port to "drop frames" if it can't keep up
+            # preventing the 5-second delay from building up.
+            "-timestamp", "now",
             virtual_video_device,
         ]
 
