@@ -67,7 +67,7 @@ def build_ffmpeg_command(
         "-map", "0:v:0",
         "-map", "1:a:0",
 
-        "-c:v", "libx264",
+        "-c:v", "h264_rkmpp",
         "-crf", "32",
         "-g", str(FPS * 2),
         "-maxrate", "1800k",
