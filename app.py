@@ -68,11 +68,10 @@ def build_ffmpeg_command(
         "-map", "1:a:0",
 
         "-c:v", "h264_rkmpp",
-        "-crf", "32",
+        "-b:v", "1800k",
         "-g", str(FPS * 2),
         "-maxrate", "1800k",
         "-bufsize", "3600k",
-        "-preset", "veryfast",
         "-c:a", "aac",
         "-b:a", "64k",
         "-af", "aresample=async=1",
