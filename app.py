@@ -10,7 +10,6 @@ OUT_AUDIO_DEVICE = "hw:4,0"
 IN_VIDEO_DEVICE = "/dev/video25"
 IN_AUDIO_DEVICE = "hw:3,0"
 
-# Virtual camera devices for AI/OpenCV team
 OUT_VIRTUAL_VIDEO_DEVICE = "/dev/video40"
 IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
 
@@ -21,14 +20,12 @@ WIDTH = 1920
 HEIGHT = 1080
 FPS = 30
 
-# Virtual stream uchun alohida parametrlari
-VIRTUAL_WIDTH = 1280
-VIRTUAL_HEIGHT = 720
-VIRTUAL_FPS = 15
+VIRTUAL_WIDTH = 1920
+VIRTUAL_HEIGHT = 1080
+VIRTUAL_FPS = 30
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 processes = []
-
 
 def build_ffmpeg_command(
     video_device,
@@ -50,7 +47,6 @@ def build_ffmpeg_command(
         "-loglevel", "warning",
         "-fflags", "+genpts",
 
-        # VIDEO INPUT
         "-thread_queue_size", "2048",
         "-f", "v4l2",
         "-input_format", "mjpeg",
@@ -58,7 +54,6 @@ def build_ffmpeg_command(
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
 
-        # AUDIO INPUT
         "-thread_queue_size", "2048",
         "-f", "alsa",
         "-channels", channels,
@@ -68,7 +63,6 @@ def build_ffmpeg_command(
         "-max_muxing_queue_size", "1024",
     ]
 
-    # 1) RECORDING OUTPUT (segment mp4)
     cmd += [
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -86,14 +80,10 @@ def build_ffmpeg_command(
         timestamp_pattern,
     ]
 
-    # 2) VIRTUAL CAMERA OUTPUT
-    # OpenCV odatda audio ishlatmaydi, shuning uchun faqat video uzatamiz
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
             "-an",
-
-            # virtual output uchun encode kerak bo'ladi
             "-vf", f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT},fps={VIRTUAL_FPS},format=yuv420p",
             "-c:v", "rawvideo",
             "-pix_fmt", "yuv420p",
@@ -102,7 +92,6 @@ def build_ffmpeg_command(
         ]
 
     return cmd
-
 
 def stop_ffmpeg(signum=None, frame=None):
     global processes
@@ -121,13 +110,11 @@ def stop_ffmpeg(signum=None, frame=None):
     print("[INFO] Hamma FFmpeg jarayonlari to'xtatildi.")
     sys.exit(0)
 
-
 def check_device_exists(device_path):
     if not os.path.exists(device_path):
         print(f"[ERROR] Device topilmadi: {device_path}")
         return False
     return True
-
 
 def main():
     global processes
@@ -181,7 +168,6 @@ def main():
 
     process_out.wait()
     process_in.wait()
-
 
 if __name__ == "__main__":
     main()
