@@ -16,9 +16,9 @@ IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
 OUTPUT_DIR = "records"
 SEGMENT_TIME = 10
 
-WIDTH = 1920
-HEIGHT = 1080
-FPS = 30
+WIDTH = 1280
+HEIGHT = 720
+FPS = 15
 
 VIRTUAL_WIDTH = 1280
 VIRTUAL_HEIGHT = 720
@@ -53,6 +53,11 @@ def build_ffmpeg_command(
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
+        "-preset", "veryfast",
+        "-crf", "32",
+        "-g", str(FPS * 2),
+        "-maxrate", "1800k",
+        "-bufsize", "3600k",
 
         "-thread_queue_size", "2048",
         "-f", "alsa",
@@ -67,9 +72,9 @@ def build_ffmpeg_command(
         "-map", "0:v:0",
         "-map", "1:a:0",
 
-        "-c:v", "copy",
+        "-c:v", "libx264",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "64k",
         "-af", "aresample=async=1",
 
         "-f", "segment",
