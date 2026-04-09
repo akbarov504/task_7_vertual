@@ -1,7 +1,12 @@
+import subprocess
+import os
+import signal
+import sys
+import time
+import threading
 from datetime import datetime, timedelta
 from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
 from db import init_db, insert_video, video_exists
-import os, sys, time, uuid, signal, threading, subprocess
 
 OUT_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0"
 OUT_AUDIO_DEVICE = "hw:Camera_1,0"
@@ -27,13 +32,24 @@ RECONNECT_DELAY = 3
 DB_SCAN_INTERVAL = 2
 FILE_STABLE_SECONDS = 2
 
-VIDEO_ID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
+GLOBAL_VIDEO_PREFIX = "VIDEO"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 stop_event = threading.Event()
 processes = {}
 process_lock = threading.Lock()
+
+def wait_until_next_segment_boundary():
+    now = time.time()
+    wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
+
+    if wait_seconds == SEGMENT_TIME:
+        wait_seconds = 0
+
+    if wait_seconds > 0:
+        print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
+        time.sleep(wait_seconds)
 
 def build_ffmpeg_command(
     video_device,
@@ -118,16 +134,6 @@ def check_video_device_exists(device_path):
 def check_virtual_device_exists(device_path):
     return os.path.exists(device_path)
 
-def wait_until_next_segment_boundary():
-    now = time.time()
-    wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
-    if wait_seconds == SEGMENT_TIME:
-        wait_seconds = 0
-
-    if wait_seconds > 0:
-        print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
-        time.sleep(wait_seconds)
-
 def terminate_process(proc, name):
     if not proc:
         return
@@ -164,21 +170,20 @@ def parse_segment_times_from_filename(file_name: str):
         start_dt = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
         end_dt = start_dt + timedelta(seconds=SEGMENT_TIME)
         segment_key = dt_part
-        return (
-            camera_type,
-            start_dt.isoformat(),
-            end_dt.isoformat(),
-            segment_key
-        )
+        return camera_type, start_dt.isoformat(), end_dt.isoformat(), segment_key
     except ValueError:
         return None, None, None, None
 
 def make_global_video_id(segment_key: str) -> str:
     """
-    Bir xil segment_key uchun bir xil globalVideoId.
-    OUT va IN bir vaqtda yozilgan bo'lsa, ikkalasiga ham bir xil ID bo'ladi.
+    Misol:
+    2026-04-09_13-10-00 -> ADAS-VID-20260409-131000
+
+    OUT va IN bir xil vaqtli segment bo'lsa,
+    ikkalasiga ham bir xil globalVideoId qaytadi.
     """
-    return str(uuid.uuid5(VIDEO_ID_NAMESPACE, segment_key))
+    dt = datetime.strptime(segment_key, "%Y-%m-%d_%H-%M-%S")
+    return f"{GLOBAL_VIDEO_PREFIX}-{dt.strftime('%Y%m%d-%H%M%S')}"
 
 def is_file_stable(file_path: str, stable_seconds: int = FILE_STABLE_SECONDS) -> bool:
     if not os.path.exists(file_path):
@@ -265,7 +270,7 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             virtual_video_device=virtual_video_device
         )
 
-        print(f"[INFO] {name}: ffmpeg ishga tushirildi")
+        print(f"[INFO] {name}: ffmpeg ishga tushiriladi")
         print(f"[INFO] {name}: VIDEO={video_device}")
         print(f"[INFO] {name}: AUDIO={audio_device}")
         print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
@@ -316,13 +321,11 @@ def main():
         print(f"[ERROR] Virtual device topilmadi: {IN_VIRTUAL_VIDEO_DEVICE}")
         sys.exit(1)
 
-    print("[INFO] Auto-reconnect recording system boshlandi")
+    print("[INFO] Sync auto-reconnect recording system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
-    print(f"[INFO] Virtual stream: {VIRTUAL_WIDTH}x{VIRTUAL_HEIGHT} @ {VIRTUAL_FPS} fps")
-    print("[INFO] Kamera sug'urilsa, dastur kutadi va qayta tiqilganda avtomatik ishga tushadi")
-    print("[INFO] Har yozilgan video DB ga saqlanadi")
-    print("[INFO] OUT va IN bir vaqtdagi segmentlar bir xil globalVideoId oladi")
+    print("[INFO] IN va OUT videolar sync bo'ladi")
+    print("[INFO] OUT va IN bir xil vaqtli segmentlar bir xil custom globalVideoId oladi")
     print("[INFO] To'xtatish uchun CTRL+C bosing\n")
 
     db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
