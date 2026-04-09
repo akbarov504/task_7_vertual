@@ -4,7 +4,9 @@ import signal
 import sys
 import time
 import threading
+import uuid
 from datetime import datetime, timedelta
+
 from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
 from db import init_db, insert_video, video_exists
 
@@ -32,13 +34,14 @@ RECONNECT_DELAY = 3
 DB_SCAN_INTERVAL = 2
 FILE_STABLE_SECONDS = 2
 
-GLOBAL_VIDEO_PREFIX = "VIDEO"
+VIDEO_ID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 stop_event = threading.Event()
 processes = {}
 process_lock = threading.Lock()
+
 
 def wait_until_next_segment_boundary():
     now = time.time()
@@ -50,6 +53,7 @@ def wait_until_next_segment_boundary():
     if wait_seconds > 0:
         print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
         time.sleep(wait_seconds)
+
 
 def build_ffmpeg_command(
     video_device,
@@ -94,11 +98,13 @@ def build_ffmpeg_command(
         "-map", "0:v:0",
         "-map", "1:a:0",
 
-       "-c:v", "h264_rkmpp",
+        "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
-        "-g", str(FPS * 2),
+        "-g", str(FPS * SEGMENT_TIME),
+        "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
         "-bufsize", "3600k",
+        "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
         "-b:a", "64k",
@@ -106,6 +112,7 @@ def build_ffmpeg_command(
 
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
+        "-segment_atclocktime", "1",
         "-segment_format", "mp4",
         "-reset_timestamps", "1",
         "-strftime", "1",
@@ -125,11 +132,14 @@ def build_ffmpeg_command(
 
     return cmd
 
+
 def check_video_device_exists(device_path):
     return os.path.exists(device_path)
 
+
 def check_virtual_device_exists(device_path):
     return os.path.exists(device_path)
+
 
 def terminate_process(proc, name):
     if not proc:
@@ -148,12 +158,8 @@ def terminate_process(proc, name):
             except subprocess.TimeoutExpired:
                 pass
 
+
 def parse_segment_times_from_filename(file_name: str):
-    """
-    Format:
-    OUT_2026-04-09_13-10-00.mp4
-    IN_2026-04-09_13-10-00.mp4
-    """
     base_name = os.path.basename(file_name)
     name_without_ext = os.path.splitext(base_name)[0]
 
@@ -171,16 +177,10 @@ def parse_segment_times_from_filename(file_name: str):
     except ValueError:
         return None, None, None, None
 
-def make_global_video_id(segment_key: str) -> str:
-    """
-    Misol:
-    2026-04-09_13-10-00 -> ADAS-VID-20260409-131000
 
-    OUT va IN bir xil vaqtli segment bo'lsa,
-    ikkalasiga ham bir xil globalVideoId qaytadi.
-    """
-    dt = datetime.strptime(segment_key, "%Y-%m-%d_%H-%M-%S")
-    return f"{GLOBAL_VIDEO_PREFIX}-{dt.strftime('%Y%m%d-%H%M%S')}"
+def make_global_video_id(segment_key: str) -> str:
+    return str(uuid.uuid5(VIDEO_ID_NAMESPACE, segment_key))
+
 
 def is_file_stable(file_path: str, stable_seconds: int = FILE_STABLE_SECONDS) -> bool:
     if not os.path.exists(file_path):
@@ -194,6 +194,7 @@ def is_file_stable(file_path: str, stable_seconds: int = FILE_STABLE_SECONDS) ->
 
     size2 = os.path.getsize(file_path)
     return size1 == size2 and size2 > 0
+
 
 def scan_and_insert_segments():
     print("[INFO] Segment DB watcher ishga tushdi")
@@ -229,17 +230,13 @@ def scan_and_insert_segments():
                     globalVideoId=global_video_id
                 )
 
-                print(
-                    f"[DB] Video saqlandi: "
-                    f"camera_type={camera_type}, "
-                    f"file_path={file_path}, "
-                    f"globalVideoId={global_video_id}"
-                )
+                print(f"[DB] Video saqlandi: {camera_type} | {file_path} | {global_video_id}")
 
         except Exception as e:
             print(f"[DB WATCHER ERROR] {e}")
 
         time.sleep(DB_SCAN_INTERVAL)
+
 
 def camera_worker(name, video_device, audio_device, virtual_video_device):
     global processes
@@ -293,6 +290,7 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
         if not stop_event.is_set():
             time.sleep(RECONNECT_DELAY)
 
+
 def stop_all(signum=None, frame=None):
     print("\n[INFO] Dastur to'xtatilmoqda...")
     stop_event.set()
@@ -303,6 +301,7 @@ def stop_all(signum=None, frame=None):
 
     print("[INFO] Hamma jarayonlar to'xtatildi.")
     sys.exit(0)
+
 
 def main():
     init_db()
@@ -321,8 +320,7 @@ def main():
     print("[INFO] Sync auto-reconnect recording system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
-    print("[INFO] IN va OUT videolar sync bo'ladi")
-    print("[INFO] OUT va IN bir xil vaqtli segmentlar bir xil custom globalVideoId oladi")
+    print("[INFO] IN va OUT videolar wall clock bo'yicha sync bo'ladi")
     print("[INFO] To'xtatish uchun CTRL+C bosing\n")
 
     db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
@@ -345,6 +343,7 @@ def main():
 
     while True:
         time.sleep(1)
+
 
 if __name__ == "__main__":
     main()
