@@ -88,7 +88,7 @@ def build_ffmpeg_command(
 
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
-        "-g", str(FPS * SEGMENT_TIME),
+        "-g", str(FPS * 2),
         "-maxrate", "1800k",
         "-bufsize", "3600k",
 
@@ -98,7 +98,7 @@ def build_ffmpeg_command(
 
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
-        "-g", str(FPS * SEGMENT_TIME),
+        "-segment_atclocktime", "1",
         "-segment_format", "mp4",
         "-reset_timestamps", "1",
         "-strftime", "1",
