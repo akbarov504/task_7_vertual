@@ -1,9 +1,7 @@
-import subprocess
-import os
-import signal
-import sys
-import time
-import threading
+from datetime import datetime, timedelta
+from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
+from db import init_db, insert_video, video_exists
+import os, sys, time, uuid, signal, threading, subprocess
 
 OUT_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0"
 OUT_AUDIO_DEVICE = "hw:Camera_1,0"
@@ -14,8 +12,8 @@ IN_AUDIO_DEVICE = "hw:Camera,0"
 OUT_VIRTUAL_VIDEO_DEVICE = "/dev/video40"
 IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
 
-OUTPUT_DIR = "records"
-SEGMENT_TIME = 10
+OUTPUT_DIR = LOCAL_PATH
+SEGMENT_TIME = VIDEO_SEGMENT_LEN
 
 WIDTH = 1920
 HEIGHT = 1080
@@ -26,6 +24,10 @@ VIRTUAL_HEIGHT = 720
 VIRTUAL_FPS = 15
 
 RECONNECT_DELAY = 3
+DB_SCAN_INTERVAL = 2
+FILE_STABLE_SECONDS = 2
+
+VIDEO_ID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -113,18 +115,6 @@ def check_video_device_exists(device_path):
 def check_virtual_device_exists(device_path):
     return os.path.exists(device_path)
 
-# def check_audio_device_exists(card_name):
-#     try:
-#         result = subprocess.run(
-#             ["arecord", "-L"],
-#             capture_output=True,
-#             text=True,
-#             timeout=5
-#         )
-#         return card_name in result.stdout
-#     except Exception:
-#         return False
-
 def terminate_process(proc, name):
     if not proc:
         return
@@ -142,23 +132,111 @@ def terminate_process(proc, name):
             except subprocess.TimeoutExpired:
                 pass
 
+def parse_segment_times_from_filename(file_name: str):
+    """
+    Format:
+    OUT_2026-04-09_13-10-00.mp4
+    IN_2026-04-09_13-10-00.mp4
+    """
+    base_name = os.path.basename(file_name)
+    name_without_ext = os.path.splitext(base_name)[0]
+
+    parts = name_without_ext.split("_", 1)
+    if len(parts) != 2:
+        return None, None, None, None
+
+    camera_type, dt_part = parts
+
+    try:
+        start_dt = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
+        end_dt = start_dt + timedelta(seconds=SEGMENT_TIME)
+        segment_key = dt_part
+        return (
+            camera_type,
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+            segment_key
+        )
+    except ValueError:
+        return None, None, None, None
+
+def make_global_video_id(segment_key: str) -> str:
+    """
+    Bir xil segment_key uchun bir xil globalVideoId.
+    OUT va IN bir vaqtda yozilgan bo'lsa, ikkalasiga ham bir xil ID bo'ladi.
+    """
+    return str(uuid.uuid5(VIDEO_ID_NAMESPACE, segment_key))
+
+def is_file_stable(file_path: str, stable_seconds: int = FILE_STABLE_SECONDS) -> bool:
+    if not os.path.exists(file_path):
+        return False
+
+    size1 = os.path.getsize(file_path)
+    time.sleep(stable_seconds)
+
+    if not os.path.exists(file_path):
+        return False
+
+    size2 = os.path.getsize(file_path)
+    return size1 == size2 and size2 > 0
+
+def scan_and_insert_segments():
+    print("[INFO] Segment DB watcher ishga tushdi")
+
+    while not stop_event.is_set():
+        try:
+            files = sorted(
+                f for f in os.listdir(OUTPUT_DIR)
+                if f.lower().endswith(".mp4")
+            )
+
+            for file_name in files:
+                file_path = os.path.join(OUTPUT_DIR, file_name)
+
+                if video_exists(file_path):
+                    continue
+
+                if not is_file_stable(file_path):
+                    continue
+
+                camera_type, start_time, end_time, segment_key = parse_segment_times_from_filename(file_name)
+                if not camera_type or not start_time or not end_time or not segment_key:
+                    print(f"[WARN] DB watcher: filename parse bo'lmadi -> {file_name}")
+                    continue
+
+                global_video_id = make_global_video_id(segment_key)
+
+                insert_video(
+                    file_path=file_path,
+                    camera_type=camera_type,
+                    start_time=start_time,
+                    end_time=end_time,
+                    globalVideoId=global_video_id
+                )
+
+                print(
+                    f"[DB] Video saqlandi: "
+                    f"camera_type={camera_type}, "
+                    f"file_path={file_path}, "
+                    f"globalVideoId={global_video_id}"
+                )
+
+        except Exception as e:
+            print(f"[DB WATCHER ERROR] {e}")
+
+        time.sleep(DB_SCAN_INTERVAL)
+
 def camera_worker(name, video_device, audio_device, virtual_video_device):
     global processes
 
     while not stop_event.is_set():
         video_ok = check_video_device_exists(video_device)
-        # audio_ok = check_audio_device_exists(audio_device)
         virtual_ok = check_virtual_device_exists(virtual_video_device)
 
         if not video_ok:
             print(f"[WARN] {name}: video device yo'q -> {video_device}")
             time.sleep(RECONNECT_DELAY)
             continue
-
-        # if not audio_ok:
-        #     print(f"[WARN] {name}: audio device yo'q -> {audio_device}")
-        #     time.sleep(RECONNECT_DELAY)
-        #     continue
 
         if not virtual_ok:
             print(f"[WARN] {name}: virtual device yo'q -> {virtual_video_device}")
@@ -211,6 +289,8 @@ def stop_all(signum=None, frame=None):
     sys.exit(0)
 
 def main():
+    init_db()
+
     signal.signal(signal.SIGINT, stop_all)
     signal.signal(signal.SIGTERM, stop_all)
 
@@ -227,7 +307,11 @@ def main():
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
     print(f"[INFO] Virtual stream: {VIRTUAL_WIDTH}x{VIRTUAL_HEIGHT} @ {VIRTUAL_FPS} fps")
     print("[INFO] Kamera sug'urilsa, dastur kutadi va qayta tiqilganda avtomatik ishga tushadi")
+    print("[INFO] Har yozilgan video DB ga saqlanadi")
+    print("[INFO] OUT va IN bir vaqtdagi segmentlar bir xil globalVideoId oladi")
     print("[INFO] To'xtatish uchun CTRL+C bosing\n")
+
+    db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
 
     out_thread = threading.Thread(
         target=camera_worker,
@@ -241,6 +325,7 @@ def main():
         daemon=True
     )
 
+    db_thread.start()
     out_thread.start()
     in_thread.start()
 
