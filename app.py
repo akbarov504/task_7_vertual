@@ -91,6 +91,7 @@ def build_ffmpeg_command(
         "-g", str(FPS * 2),
         "-maxrate", "1800k",
         "-bufsize", "3600k",
+        "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
         "-b:a", "64k",
