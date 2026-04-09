@@ -6,10 +6,10 @@ import time
 import threading
 
 OUT_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0"
-OUT_AUDIO_DEVICE = "hw:4,0"
+OUT_AUDIO_DEVICE = "hw:Camera_1,0"
 
 IN_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.10.auto-usb-0:1:1.0-video-index0"
-IN_AUDIO_DEVICE = "hw:3,0"
+IN_AUDIO_DEVICE = "hw:Camera,0"
 
 OUT_VIRTUAL_VIDEO_DEVICE = "/dev/video40"
 IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
@@ -113,17 +113,17 @@ def check_video_device_exists(device_path):
 def check_virtual_device_exists(device_path):
     return os.path.exists(device_path)
 
-def check_audio_device_exists(card_name):
-    try:
-        result = subprocess.run(
-            ["arecord", "-L"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        return card_name in result.stdout
-    except Exception:
-        return False
+# def check_audio_device_exists(card_name):
+#     try:
+#         result = subprocess.run(
+#             ["arecord", "-L"],
+#             capture_output=True,
+#             text=True,
+#             timeout=5
+#         )
+#         return card_name in result.stdout
+#     except Exception:
+#         return False
 
 def terminate_process(proc, name):
     if not proc:
@@ -147,7 +147,7 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
 
     while not stop_event.is_set():
         video_ok = check_video_device_exists(video_device)
-        audio_ok = check_audio_device_exists(audio_device)
+        # audio_ok = check_audio_device_exists(audio_device)
         virtual_ok = check_virtual_device_exists(virtual_video_device)
 
         if not video_ok:
@@ -155,10 +155,10 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             time.sleep(RECONNECT_DELAY)
             continue
 
-        if not audio_ok:
-            print(f"[WARN] {name}: audio device yo'q -> {audio_device}")
-            time.sleep(RECONNECT_DELAY)
-            continue
+        # if not audio_ok:
+        #     print(f"[WARN] {name}: audio device yo'q -> {audio_device}")
+        #     time.sleep(RECONNECT_DELAY)
+        #     continue
 
         if not virtual_ok:
             print(f"[WARN] {name}: virtual device yo'q -> {virtual_video_device}")
