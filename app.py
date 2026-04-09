@@ -89,6 +89,7 @@ def build_ffmpeg_command(
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
         "-g", str(FPS * 2),
+        "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
         "-bufsize", "3600k",
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
