@@ -6,10 +6,10 @@ import time
 import threading
 
 OUT_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0"
-OUT_AUDIO_DEVICE = "hw:Camera_1,0"
+OUT_AUDIO_DEVICE = "hw:4,0"
 
 IN_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.10.auto-usb-0:1:1.0-video-index0"
-IN_AUDIO_DEVICE = "hw:Camera,0"
+IN_AUDIO_DEVICE = "hw:3,0"
 
 OUT_VIRTUAL_VIDEO_DEVICE = "/dev/video40"
 IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
