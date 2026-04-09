@@ -80,9 +80,11 @@ def build_ffmpeg_command(
 
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
-        "-g", str(FPS * 2),
+        "-g", str(FPS * SEGMENT_TIME),
+        "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
         "-bufsize", "3600k",
+        "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
         "-b:a", "64k",
@@ -90,6 +92,7 @@ def build_ffmpeg_command(
 
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
+        "-segment_atclocktime", "1",
         "-segment_format", "mp4",
         "-reset_timestamps", "1",
         "-strftime", "1",
@@ -114,6 +117,16 @@ def check_video_device_exists(device_path):
 
 def check_virtual_device_exists(device_path):
     return os.path.exists(device_path)
+
+def wait_until_next_segment_boundary():
+    now = time.time()
+    wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
+    if wait_seconds == SEGMENT_TIME:
+        wait_seconds = 0
+
+    if wait_seconds > 0:
+        print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
+        time.sleep(wait_seconds)
 
 def terminate_process(proc, name):
     if not proc:
@@ -257,6 +270,7 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
         print(f"[INFO] {name}: AUDIO={audio_device}")
         print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
 
+        wait_until_next_segment_boundary()
         proc = subprocess.Popen(cmd)
 
         with process_lock:
