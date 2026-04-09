@@ -43,14 +43,16 @@ processes = {}
 process_lock = threading.Lock()
 
 def wait_until_next_segment_boundary():
-    now = time.time()
-    wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
-    if wait_seconds == SEGMENT_TIME:
-        wait_seconds = 0
+    while True:
+        now = time.time()
+        wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
+        if wait_seconds == SEGMENT_TIME:
+            wait_seconds = 0
 
-    if wait_seconds > 0:
-        print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
-        time.sleep(wait_seconds)
+        if wait_seconds > 0:
+            print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
+            continue
+        return None
 
 def build_ffmpeg_command(
     video_device,
