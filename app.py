@@ -42,6 +42,15 @@ stop_event = threading.Event()
 processes = {}
 process_lock = threading.Lock()
 
+def wait_until_next_segment_boundary():
+    now = time.time()
+    wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
+    if wait_seconds == SEGMENT_TIME:
+        wait_seconds = 0
+
+    if wait_seconds > 0:
+        print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
+        time.sleep(wait_seconds)
 
 def build_ffmpeg_command(
     video_device,
@@ -89,7 +98,6 @@ def build_ffmpeg_command(
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
         "-g", str(FPS * 2),
-        "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
         "-bufsize", "3600k",
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
@@ -276,6 +284,7 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
         print(f"[INFO] {name}: AUDIO={audio_device}")
         print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
 
+        wait_until_next_segment_boundary()
         proc = subprocess.Popen(cmd)
 
         with process_lock:
