@@ -26,9 +26,9 @@ WIDTH = 1920
 HEIGHT = 1080
 FPS = 30
 
-VIRTUAL_WIDTH = 1280
-VIRTUAL_HEIGHT = 720
-VIRTUAL_FPS = 15
+VIRTUAL_WIDTH = 854
+VIRTUAL_HEIGHT = 480
+VIRTUAL_FPS = 30
 
 RECONNECT_DELAY = 3
 DB_SCAN_INTERVAL = 2
@@ -109,7 +109,7 @@ def build_ffmpeg_command(
         cmd += [
             "-map", "0:v:0",
             "-an",
-            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=lanczos,format=yuyv422",
+            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=fast_bilinear,format=yuyv422",
             "-c:v", "rawvideo",
             "-pix_fmt", "yuyv422",
             "-f", "v4l2",
