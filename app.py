@@ -1,11 +1,13 @@
 import os
-import sys
 import time
 import signal
 import threading
 import subprocess
 from datetime import datetime, timedelta
 from multiprocessing import shared_memory
+
+import cv2
+import numpy as np
 
 from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
 from db import init_db, insert_video, video_exists
@@ -20,17 +22,20 @@ IN_AUDIO_DEVICE = "hw:Camera,0"
 OUTPUT_DIR = LOCAL_PATH
 SEGMENT_TIME = VIDEO_SEGMENT_LEN
 
-# Capture / record
+# Recording side
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 20
 
-# Shared memory frame size
+# Shared memory side
 SHM_WIDTH = 1280
 SHM_HEIGHT = 720
 SHM_CHANNELS = 3
-SHM_FPS = 10
-FRAME_SIZE = SHM_WIDTH * SHM_HEIGHT * SHM_CHANNELS
+SHM_FRAME_SIZE = SHM_WIDTH * SHM_HEIGHT * SHM_CHANNELS
+
+# MJPEG pipe side
+PIPE_FPS = 10
+PIPE_JPEG_Q = 7   # 2 yaxshi sifat, 31 past sifat. 7 balans.
 
 RECONNECT_DELAY = 3
 DB_SCAN_INTERVAL = 2
@@ -66,15 +71,22 @@ class SharedFrameWriter:
         self.shm = shared_memory.SharedMemory(create=True, size=self.total_size, name=shm_name)
         self.buf = self.shm.buf
 
-    def write_bytes(self, frame_bytes: bytes):
-        if len(frame_bytes) != self.frame_size:
+    def write_frame(self, frame: np.ndarray):
+        if frame is None:
             return
 
-        # 0 = writing, 1 = ready
+        if frame.shape[:2] != (self.height, self.width):
+            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+
+        if frame.ndim != 3 or frame.shape[2] != self.channels:
+            return
+
+        frame = np.ascontiguousarray(frame, dtype=np.uint8)
+
         self.buf[0] = 0
         ts = int(time.time() * 1000)
         self.buf[8:16] = ts.to_bytes(8, byteorder="little", signed=False)
-        self.buf[16:16 + self.frame_size] = frame_bytes
+        self.buf[16:16 + self.frame_size] = frame.tobytes()
         self.buf[0] = 1
 
     def close(self):
@@ -112,7 +124,7 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         "-hide_banner",
         "-loglevel", "warning",
 
-        # Input
+        # Video input
         "-thread_queue_size", "256",
         "-f", "v4l2",
         "-input_format", "mjpeg",
@@ -120,15 +132,19 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
 
+        # Audio input
         "-thread_queue_size", "1024",
         "-f", "alsa",
         "-channels", "2",
         "-sample_rate", "48000",
         "-i", audio_device,
 
-        # Output 1: recording
+        # -----------------------
+        # Output 1: segment record
+        # -----------------------
         "-map", "0:v:0",
         "-map", "1:a:0",
+
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
         "-g", str(FPS * SEGMENT_TIME),
@@ -136,10 +152,12 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         "-maxrate", "1800k",
         "-bufsize", "1800k",
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
+
         "-c:a", "aac",
         "-b:a", "96k",
         "-ar", "44100",
         "-af", "aresample=async=1000:min_hard_comp=0.100:first_pts=0",
+
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
         "-segment_atclocktime", "1",
@@ -148,16 +166,19 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         "-strftime", "1",
         timestamp_pattern,
 
-        # Output 2: rawvideo -> stdout pipe
+        # -----------------------
+        # Output 2: MJPEG pipe for SHM
+        # -----------------------
         "-map", "0:v:0",
         "-an",
-        "-fflags", "nobuffer",
-        "-flags", "low_delay",
-        "-vf", f"fps={SHM_FPS},scale={SHM_WIDTH}:{SHM_HEIGHT}:flags=fast_bilinear,format=bgr24",
-        "-pix_fmt", "bgr24",
-        "-f", "rawvideo",
+        "-vf", f"fps={PIPE_FPS},scale={SHM_WIDTH}:{SHM_HEIGHT}:flags=fast_bilinear",
+        "-c:v", "mjpeg",
+        "-q:v", str(PIPE_JPEG_Q),
+        "-f", "image2pipe",
+        "-update", "1",
         "pipe:1",
     ]
+
     return cmd
 
 
@@ -249,6 +270,51 @@ def scan_and_insert_segments():
         time.sleep(DB_SCAN_INTERVAL)
 
 
+def consume_stderr(proc, name):
+    try:
+        while not stop_event.is_set():
+            line = proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode(errors="ignore").strip()
+            if text:
+                print(f"[FFMPEG {name}] {text}")
+    except Exception:
+        pass
+
+
+def mjpeg_frames_from_pipe(pipe):
+    """
+    MJPEG stream ichidan JPEG frame'larni ajratadi.
+    """
+    buffer = bytearray()
+    soi = b"\xff\xd8"
+    eoi = b"\xff\xd9"
+
+    while not stop_event.is_set():
+        chunk = pipe.read(8192)
+        if not chunk:
+            return
+        buffer.extend(chunk)
+
+        while True:
+            start = buffer.find(soi)
+            if start == -1:
+                if len(buffer) > 1024 * 1024:
+                    buffer.clear()
+                break
+
+            end = buffer.find(eoi, start + 2)
+            if end == -1:
+                if start > 0:
+                    del buffer[:start]
+                break
+
+            jpg = bytes(buffer[start:end + 2])
+            del buffer[:end + 2]
+            yield jpg
+
+
 def ffmpeg_camera_worker(name, video_device, audio_device, shm_name):
     shm_writer = SharedFrameWriter(shm_name, SHM_WIDTH, SHM_HEIGHT, SHM_CHANNELS)
     proc = None
@@ -286,13 +352,14 @@ def ffmpeg_camera_worker(name, video_device, audio_device, shm_name):
             )
             stderr_thread.start()
 
-            while not stop_event.is_set():
-                chunk = read_exact(proc.stdout, FRAME_SIZE)
-                if chunk is None:
-                    print(f"[WARN] {name}: rawvideo pipe uzildi, restart bo'ladi")
-                    break
+            for jpg_bytes in mjpeg_frames_from_pipe(proc.stdout):
+                npbuf = np.frombuffer(jpg_bytes, dtype=np.uint8)
+                frame = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    shm_writer.write_frame(frame)
 
-                shm_writer.write_bytes(chunk)
+                if stop_event.is_set():
+                    break
 
                 if proc.poll() is not None:
                     print(f"[WARN] {name}: ffmpeg to'xtab qoldi (code={proc.returncode})")
@@ -313,29 +380,6 @@ def ffmpeg_camera_worker(name, video_device, audio_device, shm_name):
         shm_writer.unlink()
 
 
-def read_exact(pipe, size):
-    data = bytearray()
-    while len(data) < size and not stop_event.is_set():
-        chunk = pipe.read(size - len(data))
-        if not chunk:
-            return None
-        data.extend(chunk)
-    return bytes(data)
-
-
-def consume_stderr(proc, name):
-    try:
-        while not stop_event.is_set():
-            line = proc.stderr.readline()
-            if not line:
-                break
-            text = line.decode(errors="ignore").strip()
-            if text:
-                print(f"[FFMPEG {name}] {text}")
-    except Exception:
-        pass
-
-
 def stop_all(signum=None, frame=None):
     print("\n[INFO] Dastur to'xtatilmoqda...")
     stop_event.set()
@@ -345,7 +389,7 @@ def stop_all(signum=None, frame=None):
             terminate_process(proc, name)
 
     print("[INFO] Hamma jarayonlar to'xtatildi.")
-    sys.exit(0)
+    raise SystemExit(0)
 
 
 def main():
@@ -354,10 +398,11 @@ def main():
     signal.signal(signal.SIGINT, stop_all)
     signal.signal(signal.SIGTERM, stop_all)
 
-    print("[INFO] FFmpeg + Shared Memory system boshlandi")
+    print("[INFO] FFmpeg + MJPEG pipe + Shared Memory system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
-    print(f"[INFO] SHM frame size: {SHM_WIDTH}x{SHM_HEIGHT}")
+    print(f"[INFO] SHM size: {SHM_WIDTH}x{SHM_HEIGHT}")
+    print(f"[INFO] PIPE FPS: {PIPE_FPS}")
 
     db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
     out_thread = threading.Thread(
