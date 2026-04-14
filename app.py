@@ -26,9 +26,10 @@ HEIGHT = 1080
 FPS = 20
 
 # Shared memory frame size
-SHM_WIDTH = 1280
-SHM_HEIGHT = 720
+SHM_WIDTH = 640
+SHM_HEIGHT = 480
 SHM_CHANNELS = 3
+SHM_FPS = 10
 FRAME_SIZE = SHM_WIDTH * SHM_HEIGHT * SHM_CHANNELS
 
 RECONNECT_DELAY = 3
@@ -150,7 +151,9 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         # Output 2: rawvideo -> stdout pipe
         "-map", "0:v:0",
         "-an",
-        "-vf", f"fps=15,scale={SHM_WIDTH}:{SHM_HEIGHT}:flags=fast_bilinear,format=bgr24",
+        "-fflags", "nobuffer",
+        "-flags", "low_delay",
+        "-vf", f"fps={SHM_FPS},scale={SHM_WIDTH}:{SHM_HEIGHT}:flags=fast_bilinear,format=bgr24",
         "-pix_fmt", "bgr24",
         "-f", "rawvideo",
         "pipe:1",
@@ -270,7 +273,7 @@ def ffmpeg_camera_worker(name, video_device, audio_device, shm_name):
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=10**8
+                bufsize=0
             )
 
             with process_lock:
