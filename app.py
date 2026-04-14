@@ -4,11 +4,11 @@ import signal
 import sys
 import time
 import threading
-import uuid
 from datetime import datetime, timedelta
 
 from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
 from db import init_db, insert_video, video_exists
+
 
 OUT_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0"
 OUT_AUDIO_DEVICE = "hw:Camera_1,0"
@@ -22,19 +22,21 @@ IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
 OUTPUT_DIR = LOCAL_PATH
 SEGMENT_TIME = VIDEO_SEGMENT_LEN
 
+# Recording input
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 20
 
-VIRTUAL_WIDTH = 640
-VIRTUAL_HEIGHT = 480
+# Virtual stream output
+VIRTUAL_WIDTH = 1280
+VIRTUAL_HEIGHT = 720
 VIRTUAL_FPS = 15
 
 RECONNECT_DELAY = 3
 DB_SCAN_INTERVAL = 2
 FILE_STABLE_SECONDS = 2
 
-VIDEO_ID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
+GLOBAL_VIDEO_PREFIX = "ADAS-VID"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -42,13 +44,24 @@ stop_event = threading.Event()
 processes = {}
 process_lock = threading.Lock()
 
-def build_ffmpeg_command(
+
+def wait_until_next_segment_boundary():
+    now = time.time()
+    wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
+    if wait_seconds == SEGMENT_TIME:
+        wait_seconds = 0
+
+    if wait_seconds > 0:
+        print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
+        time.sleep(wait_seconds)
+
+
+def build_recording_ffmpeg_command(
     video_device,
     audio_device,
     channels,
     sample_rate,
     prefix,
-    virtual_video_device=None
 ):
     timestamp_pattern = os.path.join(
         OUTPUT_DIR,
@@ -61,15 +74,10 @@ def build_ffmpeg_command(
         "-hide_banner",
         "-loglevel", "warning",
 
-        # low latency uchun
-        "-fflags", "nobuffer+genpts",
-        "-flags", "low_delay",
-        "-avioflags", "direct",
-        "-probesize", "32",
-        "-analyzeduration", "0",
+        "-fflags", "genpts",
+        "-thread_queue_size", "256",
 
         # VIDEO INPUT
-        "-thread_queue_size", "64",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
@@ -77,20 +85,18 @@ def build_ffmpeg_command(
         "-i", video_device,
 
         # AUDIO INPUT
-        "-thread_queue_size", "64",
+        "-thread_queue_size", "1024",
         "-f", "alsa",
         "-channels", channels,
         "-sample_rate", sample_rate,
         "-i", audio_device,
 
-        "-max_muxing_queue_size", "256",
-    ]
+        "-max_muxing_queue_size", "512",
 
-    # 1) RECORDING OUTPUT
-    cmd += [
         "-map", "0:v:0",
         "-map", "1:a:0",
 
+        # VIDEO ENCODE
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
         "-g", str(FPS * SEGMENT_TIME),
@@ -99,10 +105,13 @@ def build_ffmpeg_command(
         "-bufsize", "1800k",
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
+        # AUDIO ENCODE
         "-c:a", "aac",
-        "-b:a", "64k",
-        "-af", "aresample=async=1:first_pts=0",
+        "-b:a", "96k",
+        "-ar", "44100",
+        "-af", "aresample=async=1000:min_hard_comp=0.100:first_pts=0",
 
+        # SEGMENT OUTPUT
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
         "-segment_atclocktime", "1",
@@ -112,23 +121,47 @@ def build_ffmpeg_command(
         timestamp_pattern,
     ]
 
-    # 2) VIRTUAL CAMERA OUTPUT
-    if virtual_video_device:
-        cmd += [
-            "-map", "0:v:0",
-            "-an",
+    return cmd
 
-            # eng katta fix shu yerda: yengilroq fps + resolution
-            "-vf", (
-                f"fps={VIRTUAL_FPS},"
-                f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=fast_bilinear,"
-                f"format=yuv420p"
-            ),
 
-            "-pix_fmt", "yuv420p",
-            "-f", "v4l2",
-            virtual_video_device,
-        ]
+def build_virtual_ffmpeg_command(
+    video_device,
+    virtual_video_device,
+):
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "warning",
+
+        # Low latency
+        "-fflags", "nobuffer+genpts+discardcorrupt",
+        "-flags", "low_delay",
+        "-avioflags", "direct",
+        "-probesize", "32",
+        "-analyzeduration", "0",
+        "-flush_packets", "1",
+
+        # VIDEO INPUT
+        "-thread_queue_size", "64",
+        "-f", "v4l2",
+        "-input_format", "mjpeg",
+        "-framerate", str(FPS),
+        "-video_size", f"{WIDTH}x{HEIGHT}",
+        "-i", video_device,
+
+        "-map", "0:v:0",
+        "-an",
+
+        "-vf", (
+            f"fps={VIRTUAL_FPS},"
+            f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=fast_bilinear,"
+            f"format=yuv420p"
+        ),
+        "-pix_fmt", "yuv420p",
+        "-f", "v4l2",
+        virtual_video_device,
+    ]
 
     return cmd
 
@@ -146,12 +179,12 @@ def terminate_process(proc, name):
         return
 
     if proc.poll() is None:
-        print(f"[INFO] {name}: ffmpeg to'xtatilmoqda...")
+        print(f"[INFO] {name}: process to'xtatilmoqda...")
         proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            print(f"[WARN] {name}: ffmpeg kill qilinmoqda...")
+            print(f"[WARN] {name}: process kill qilinmoqda...")
             proc.kill()
             try:
                 proc.wait(timeout=2)
@@ -160,11 +193,6 @@ def terminate_process(proc, name):
 
 
 def parse_segment_times_from_filename(file_name: str):
-    """
-    Format:
-    OUT_2026-04-09_13-10-00.mp4
-    IN_2026-04-09_13-10-00.mp4
-    """
     base_name = os.path.basename(file_name)
     name_without_ext = os.path.splitext(base_name)[0]
 
@@ -189,11 +217,8 @@ def parse_segment_times_from_filename(file_name: str):
 
 
 def make_global_video_id(segment_key: str) -> str:
-    """
-    Bir xil segment_key uchun bir xil globalVideoId.
-    OUT va IN bir vaqtda yozilgan bo'lsa, ikkalasiga ham bir xil ID bo'ladi.
-    """
-    return str(uuid.uuid5(VIDEO_ID_NAMESPACE, segment_key))
+    dt = datetime.strptime(segment_key, "%Y-%m-%d_%H-%M-%S")
+    return f"{GLOBAL_VIDEO_PREFIX}-{dt.strftime('%Y%m%d-%H%M%S')}"
 
 
 def is_file_stable(file_path: str, stable_seconds: int = FILE_STABLE_SECONDS) -> bool:
@@ -274,38 +299,56 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             time.sleep(RECONNECT_DELAY)
             continue
 
-        cmd = build_ffmpeg_command(
+        record_cmd = build_recording_ffmpeg_command(
             video_device=video_device,
             audio_device=audio_device,
             channels="2",
             sample_rate="48000",
             prefix=name,
-            virtual_video_device=virtual_video_device
         )
 
-        print(f"[INFO] {name}: ffmpeg ishga tushirildi")
+        virtual_cmd = build_virtual_ffmpeg_command(
+            video_device=video_device,
+            virtual_video_device=virtual_video_device,
+        )
+
+        print(f"[INFO] {name}: recording va virtual process ishga tushiriladi")
         print(f"[INFO] {name}: VIDEO={video_device}")
         print(f"[INFO] {name}: AUDIO={audio_device}")
         print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
 
-        proc = subprocess.Popen(cmd)
+        wait_until_next_segment_boundary()
+
+        record_proc = subprocess.Popen(record_cmd)
+        virtual_proc = subprocess.Popen(virtual_cmd)
 
         with process_lock:
-            processes[name] = proc
+            processes[f"{name}_record"] = record_proc
+            processes[f"{name}_virtual"] = virtual_proc
 
         while not stop_event.is_set():
-            ret = proc.poll()
-            if ret is not None:
-                print(f"[WARN] {name}: ffmpeg to'xtab qoldi (code={ret}). Qayta ulanish kutilmoqda...")
+            record_ret = record_proc.poll()
+            virtual_ret = virtual_proc.poll()
+
+            if record_ret is not None:
+                print(f"[WARN] {name}: recording process to'xtab qoldi (code={record_ret})")
                 break
+
+            if virtual_ret is not None:
+                print(f"[WARN] {name}: virtual process to'xtab qoldi (code={virtual_ret})")
+                break
+
             time.sleep(1)
 
-        terminate_process(proc, name)
+        terminate_process(record_proc, f"{name}_record")
+        terminate_process(virtual_proc, f"{name}_virtual")
 
         with process_lock:
-            processes[name] = None
+            processes[f"{name}_record"] = None
+            processes[f"{name}_virtual"] = None
 
         if not stop_event.is_set():
+            print(f"[INFO] {name}: qayta ulanishga urinish...")
             time.sleep(RECONNECT_DELAY)
 
 
@@ -335,12 +378,11 @@ def main():
         print(f"[ERROR] Virtual device topilmadi: {IN_VIRTUAL_VIDEO_DEVICE}")
         sys.exit(1)
 
-    print("[INFO] Auto-reconnect recording system boshlandi")
+    print("[INFO] Split-process recording system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
     print(f"[INFO] Virtual stream: {VIRTUAL_WIDTH}x{VIRTUAL_HEIGHT} @ {VIRTUAL_FPS} fps")
-    print("[INFO] Kamera sug'urilsa, dastur kutadi va qayta tiqilganda avtomatik ishga tushadi")
-    print("[INFO] Har yozilgan video DB ga saqlanadi")
+    print("[INFO] Recording va virtual stream alohida processlarda ishlaydi")
     print("[INFO] OUT va IN bir vaqtdagi segmentlar bir xil globalVideoId oladi")
     print("[INFO] To'xtatish uchun CTRL+C bosing\n")
 
