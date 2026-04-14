@@ -60,41 +60,48 @@ def build_ffmpeg_command(
         "-nostdin",
         "-hide_banner",
         "-loglevel", "warning",
+
+        # low latency uchun
         "-fflags", "nobuffer+genpts",
         "-flags", "low_delay",
+        "-avioflags", "direct",
         "-probesize", "32",
         "-analyzeduration", "0",
 
-        "-thread_queue_size", "2048",
+        # VIDEO INPUT
+        "-thread_queue_size", "64",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
 
-        "-thread_queue_size", "2048",
+        # AUDIO INPUT
+        "-thread_queue_size", "64",
         "-f", "alsa",
         "-channels", channels,
         "-sample_rate", sample_rate,
         "-i", audio_device,
 
-        "-max_muxing_queue_size", "1024",
+        "-max_muxing_queue_size", "256",
     ]
 
+    # 1) RECORDING OUTPUT
     cmd += [
         "-map", "0:v:0",
         "-map", "1:a:0",
 
         "-c:v", "h264_rkmpp",
         "-b:v", "1800k",
-        "-g", str(FPS * 2),
+        "-g", str(FPS * SEGMENT_TIME),
+        "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
-        "-bufsize", "3600k",
+        "-bufsize", "1800k",
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
         "-b:a", "64k",
-        "-af", "aresample=async=1",
+        "-af", "aresample=async=1:first_pts=0",
 
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
@@ -105,13 +112,20 @@ def build_ffmpeg_command(
         timestamp_pattern,
     ]
 
+    # 2) VIRTUAL CAMERA OUTPUT
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
             "-an",
-            "-vf", f"fps={VIRTUAL_FPS},scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=fast_bilinear,format=yuyv422",
-            "-c:v", "rawvideo",
-            "-pix_fmt", "yuyv422",
+
+            # eng katta fix shu yerda: yengilroq fps + resolution
+            "-vf", (
+                f"fps={VIRTUAL_FPS},"
+                f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=fast_bilinear,"
+                f"format=yuv420p"
+            ),
+
+            "-pix_fmt", "yuv420p",
             "-f", "v4l2",
             virtual_video_device,
         ]
