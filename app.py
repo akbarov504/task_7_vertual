@@ -34,8 +34,8 @@ SHM_CHANNELS = 3
 SHM_FRAME_SIZE = SHM_WIDTH * SHM_HEIGHT * SHM_CHANNELS
 
 # MJPEG pipe side
-PIPE_FPS = 10
-PIPE_JPEG_Q = 7   # 2 yaxshi sifat, 31 past sifat. 7 balans.
+PIPE_FPS = 8
+PIPE_JPEG_Q = 9   # 2 yaxshi sifat, 31 past sifat. 7 balans.
 
 RECONNECT_DELAY = 3
 DB_SCAN_INTERVAL = 2
