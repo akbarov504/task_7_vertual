@@ -1,17 +1,14 @@
-import os
-import time
-import signal
-import threading
 import subprocess
+import os
+import signal
+import sys
+import time
+import threading
+import uuid
 from datetime import datetime, timedelta
-from multiprocessing import shared_memory
-
-import cv2
-import numpy as np
 
 from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
 from db import init_db, insert_video, video_exists
-
 
 OUT_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0"
 OUT_AUDIO_DEVICE = "hw:Camera_1,0"
@@ -19,100 +16,41 @@ OUT_AUDIO_DEVICE = "hw:Camera_1,0"
 IN_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.10.auto-usb-0:1:1.0-video-index0"
 IN_AUDIO_DEVICE = "hw:Camera,0"
 
-OUTPUT_DIR = LOCAL_PATH
+OUT_VIRTUAL_VIDEO_DEVICE = "/dev/video40"
+IN_VIRTUAL_VIDEO_DEVICE  = "/dev/video41"
+
+OUTPUT_DIR   = LOCAL_PATH
 SEGMENT_TIME = VIDEO_SEGMENT_LEN
 
-# Recording side
-WIDTH = 1920
+WIDTH  = 1920
 HEIGHT = 1080
-FPS = 20
+FPS    = 20
 
-# Shared memory side
-SHM_WIDTH = 1280
-SHM_HEIGHT = 720
-SHM_CHANNELS = 3
-SHM_FRAME_SIZE = SHM_WIDTH * SHM_HEIGHT * SHM_CHANNELS
+VIRTUAL_WIDTH  = 1280
+VIRTUAL_HEIGHT = 720
+VIRTUAL_FPS    = 15
 
-# MJPEG pipe side
-PIPE_FPS = 8
-PIPE_JPEG_Q = 9   # 2 yaxshi sifat, 31 past sifat. 7 balans.
-
-RECONNECT_DELAY = 3
-DB_SCAN_INTERVAL = 2
+RECONNECT_DELAY    = 3
+DB_SCAN_INTERVAL   = 2
 FILE_STABLE_SECONDS = 2
 
-GLOBAL_VIDEO_PREFIX = "ADAS-VID"
+VIDEO_ID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-stop_event = threading.Event()
-processes = {}
+stop_event   = threading.Event()
+processes    = {}
 process_lock = threading.Lock()
 
 
-class SharedFrameWriter:
-    def __init__(self, shm_name, width, height, channels):
-        self.shm_name = shm_name
-        self.width = width
-        self.height = height
-        self.channels = channels
-        self.frame_size = width * height * channels
-        self.total_size = 16 + self.frame_size
-
-        try:
-            old = shared_memory.SharedMemory(name=shm_name)
-            old.close()
-            old.unlink()
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-
-        self.shm = shared_memory.SharedMemory(create=True, size=self.total_size, name=shm_name)
-        self.buf = self.shm.buf
-
-    def write_frame(self, frame: np.ndarray):
-        if frame is None:
-            return
-
-        if frame.shape[:2] != (self.height, self.width):
-            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-
-        if frame.ndim != 3 or frame.shape[2] != self.channels:
-            return
-
-        frame = np.ascontiguousarray(frame, dtype=np.uint8)
-
-        self.buf[0] = 0
-        ts = int(time.time() * 1000)
-        self.buf[8:16] = ts.to_bytes(8, byteorder="little", signed=False)
-        self.buf[16:16 + self.frame_size] = frame.tobytes()
-        self.buf[0] = 1
-
-    def close(self):
-        try:
-            self.shm.close()
-        except Exception:
-            pass
-
-    def unlink(self):
-        try:
-            self.shm.unlink()
-        except Exception:
-            pass
-
-
-def wait_until_next_segment_boundary():
-    now = time.time()
-    wait_seconds = SEGMENT_TIME - (int(now) % SEGMENT_TIME)
-    if wait_seconds == SEGMENT_TIME:
-        wait_seconds = 0
-    if wait_seconds > 0:
-        print(f"[INFO] Keyingi {SEGMENT_TIME}s boundary kutilmoqda: {wait_seconds} sec")
-        time.sleep(wait_seconds)
-
-
-def build_ffmpeg_command(video_device, audio_device, prefix):
+def build_ffmpeg_command(
+    video_device,
+    audio_device,
+    channels,
+    sample_rate,
+    prefix,
+    virtual_video_device=None
+):
     timestamp_pattern = os.path.join(
         OUTPUT_DIR,
         f"{prefix}_%Y-%m-%d_%H-%M-%S.mp4"
@@ -124,24 +62,33 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         "-hide_banner",
         "-loglevel", "warning",
 
-        # Video input
-        "-thread_queue_size", "256",
+        # Low latency flags
+        "-fflags", "nobuffer+genpts",
+        "-flags", "low_delay",
+        "-avioflags", "direct",
+        "-probesize", "32",
+        "-analyzeduration", "0",
+
+        # VIDEO INPUT
+        "-thread_queue_size", "64",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
 
-        # Audio input
-        "-thread_queue_size", "1024",
+        # AUDIO INPUT
+        "-thread_queue_size", "64",
         "-f", "alsa",
-        "-channels", "2",
-        "-sample_rate", "48000",
+        "-channels", channels,
+        "-sample_rate", sample_rate,
         "-i", audio_device,
 
-        # -----------------------
-        # Output 1: segment record
-        # -----------------------
+        "-max_muxing_queue_size", "256",
+    ]
+
+    # 1) RECORDING OUTPUT
+    cmd += [
         "-map", "0:v:0",
         "-map", "1:a:0",
 
@@ -154,9 +101,8 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
-        "-b:a", "96k",
-        "-ar", "44100",
-        "-af", "aresample=async=1000:min_hard_comp=0.100:first_pts=0",
+        "-b:a", "64k",
+        "-af", "aresample=async=1:first_pts=0",
 
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
@@ -165,19 +111,24 @@ def build_ffmpeg_command(video_device, audio_device, prefix):
         "-reset_timestamps", "1",
         "-strftime", "1",
         timestamp_pattern,
-
-        # -----------------------
-        # Output 2: MJPEG pipe for SHM
-        # -----------------------
-        "-map", "0:v:0",
-        "-an",
-        "-vf", f"fps={PIPE_FPS},scale={SHM_WIDTH}:{SHM_HEIGHT}:flags=fast_bilinear",
-        "-c:v", "mjpeg",
-        "-q:v", str(PIPE_JPEG_Q),
-        "-f", "image2pipe",
-        "-update", "1",
-        "pipe:1",
     ]
+
+    # 2) VIRTUAL CAMERA OUTPUT (1280x720 @ 15fps)
+    if virtual_video_device:
+        cmd += [
+            "-map", "0:v:0",
+            "-an",
+
+            "-vf", (
+                f"fps={VIRTUAL_FPS},"
+                f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=fast_bilinear,"
+                f"format=yuv420p"
+            ),
+
+            "-pix_fmt", "yuv420p",
+            "-f", "v4l2",
+            virtual_video_device,
+        ]
 
     return cmd
 
@@ -186,9 +137,14 @@ def check_video_device_exists(device_path):
     return os.path.exists(device_path)
 
 
+def check_virtual_device_exists(device_path):
+    return os.path.exists(device_path)
+
+
 def terminate_process(proc, name):
     if not proc:
         return
+
     if proc.poll() is None:
         print(f"[INFO] {name}: ffmpeg to'xtatilmoqda...")
         proc.terminate()
@@ -204,52 +160,78 @@ def terminate_process(proc, name):
 
 
 def parse_segment_times_from_filename(file_name: str):
-    base_name = os.path.basename(file_name)
+    """
+    Format:
+      OUT_2026-04-09_13-10-00.mp4
+      IN_2026-04-09_13-10-00.mp4
+    """
+    base_name        = os.path.basename(file_name)
     name_without_ext = os.path.splitext(base_name)[0]
-    parts = name_without_ext.split("_", 1)
+    parts            = name_without_ext.split("_", 1)
+
     if len(parts) != 2:
         return None, None, None, None
 
     camera_type, dt_part = parts
+
     try:
-        start_dt = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
-        end_dt = start_dt + timedelta(seconds=SEGMENT_TIME)
+        start_dt    = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
+        end_dt      = start_dt + timedelta(seconds=SEGMENT_TIME)
         segment_key = dt_part
-        return camera_type, start_dt.isoformat(), end_dt.isoformat(), segment_key
+        return (
+            camera_type,
+            start_dt.isoformat(),
+            end_dt.isoformat(),
+            segment_key
+        )
     except ValueError:
         return None, None, None, None
 
 
 def make_global_video_id(segment_key: str) -> str:
-    dt = datetime.strptime(segment_key, "%Y-%m-%d_%H-%M-%S")
-    return f"{GLOBAL_VIDEO_PREFIX}-{dt.strftime('%Y%m%d-%H%M%S')}"
+    """
+    Bir xil segment_key => bir xil globalVideoId.
+    OUT va IN bir vaqtda yozilgan bo'lsa, ikkalasiga ham bir xil ID.
+    """
+    return str(uuid.uuid5(VIDEO_ID_NAMESPACE, segment_key))
 
 
 def is_file_stable(file_path: str, stable_seconds: int = FILE_STABLE_SECONDS) -> bool:
     if not os.path.exists(file_path):
         return False
+
     size1 = os.path.getsize(file_path)
     time.sleep(stable_seconds)
+
     if not os.path.exists(file_path):
         return False
+
     size2 = os.path.getsize(file_path)
     return size1 == size2 and size2 > 0
 
 
 def scan_and_insert_segments():
     print("[INFO] Segment DB watcher ishga tushdi")
+
     while not stop_event.is_set():
         try:
-            files = sorted(f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".mp4"))
+            files = sorted(
+                f for f in os.listdir(OUTPUT_DIR)
+                if f.lower().endswith(".mp4")
+            )
+
             for file_name in files:
                 file_path = os.path.join(OUTPUT_DIR, file_name)
 
                 if video_exists(file_path):
                     continue
+
                 if not is_file_stable(file_path):
                     continue
 
-                camera_type, start_time, end_time, segment_key = parse_segment_times_from_filename(file_name)
+                camera_type, start_time, end_time, segment_key = \
+                    parse_segment_times_from_filename(file_name)
+
                 if not camera_type or not start_time or not end_time or not segment_key:
                     print(f"[WARN] DB watcher: filename parse bo'lmadi -> {file_name}")
                     continue
@@ -263,121 +245,70 @@ def scan_and_insert_segments():
                     end_time=end_time,
                     globalVideoId=global_video_id
                 )
-                print(f"[DB] Video saqlandi: {camera_type} | {file_path} | {global_video_id}")
+
+                print(
+                    f"[DB] Video saqlandi: "
+                    f"camera_type={camera_type}, "
+                    f"file_path={file_path}, "
+                    f"globalVideoId={global_video_id}"
+                )
+
         except Exception as e:
             print(f"[DB WATCHER ERROR] {e}")
 
         time.sleep(DB_SCAN_INTERVAL)
 
 
-def consume_stderr(proc, name):
-    try:
-        while not stop_event.is_set():
-            line = proc.stderr.readline()
-            if not line:
-                break
-            text = line.decode(errors="ignore").strip()
-            if text:
-                print(f"[FFMPEG {name}] {text}")
-    except Exception:
-        pass
-
-
-def mjpeg_frames_from_pipe(pipe):
-    """
-    MJPEG stream ichidan JPEG frame'larni ajratadi.
-    """
-    buffer = bytearray()
-    soi = b"\xff\xd8"
-    eoi = b"\xff\xd9"
+def camera_worker(name, video_device, audio_device, virtual_video_device):
+    global processes
 
     while not stop_event.is_set():
-        chunk = pipe.read(8192)
-        if not chunk:
-            return
-        buffer.extend(chunk)
+        video_ok   = check_video_device_exists(video_device)
+        virtual_ok = check_virtual_device_exists(virtual_video_device)
 
-        while True:
-            start = buffer.find(soi)
-            if start == -1:
-                if len(buffer) > 1024 * 1024:
-                    buffer.clear()
-                break
+        if not video_ok:
+            print(f"[WARN] {name}: video device yo'q -> {video_device}")
+            time.sleep(RECONNECT_DELAY)
+            continue
 
-            end = buffer.find(eoi, start + 2)
-            if end == -1:
-                if start > 0:
-                    del buffer[:start]
-                break
+        if not virtual_ok:
+            print(f"[WARN] {name}: virtual device yo'q -> {virtual_video_device}")
+            time.sleep(RECONNECT_DELAY)
+            continue
 
-            jpg = bytes(buffer[start:end + 2])
-            del buffer[:end + 2]
-            yield jpg
+        cmd = build_ffmpeg_command(
+            video_device=video_device,
+            audio_device=audio_device,
+            channels="2",
+            sample_rate="48000",
+            prefix=name,
+            virtual_video_device=virtual_video_device
+        )
 
+        print(f"[INFO] {name}: ffmpeg ishga tushirildi")
+        print(f"[INFO] {name}: VIDEO={video_device}")
+        print(f"[INFO] {name}: AUDIO={audio_device}")
+        print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
 
-def ffmpeg_camera_worker(name, video_device, audio_device, shm_name):
-    shm_writer = SharedFrameWriter(shm_name, SHM_WIDTH, SHM_HEIGHT, SHM_CHANNELS)
-    proc = None
+        proc = subprocess.Popen(cmd)
 
-    try:
+        with process_lock:
+            processes[name] = proc
+
         while not stop_event.is_set():
-            if not check_video_device_exists(video_device):
-                print(f"[WARN] {name}: video device yo'q -> {video_device}")
-                time.sleep(RECONNECT_DELAY)
-                continue
+            ret = proc.poll()
+            if ret is not None:
+                print(f"[WARN] {name}: ffmpeg to'xtab qoldi (code={ret}). Qayta ulanish...")
+                break
+            time.sleep(1)
 
-            cmd = build_ffmpeg_command(video_device, audio_device, name)
+        terminate_process(proc, name)
 
-            print(f"[INFO] {name}: ffmpeg ishga tushiriladi")
-            print(f"[INFO] {name}: VIDEO={video_device}")
-            print(f"[INFO] {name}: AUDIO={audio_device}")
-            print(f"[INFO] {name}: SHM={shm_name}")
+        with process_lock:
+            processes[name] = None
 
-            wait_until_next_segment_boundary()
-
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
-
-            with process_lock:
-                processes[name] = proc
-
-            stderr_thread = threading.Thread(
-                target=consume_stderr,
-                args=(proc, name),
-                daemon=True
-            )
-            stderr_thread.start()
-
-            for jpg_bytes in mjpeg_frames_from_pipe(proc.stdout):
-                npbuf = np.frombuffer(jpg_bytes, dtype=np.uint8)
-                frame = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    shm_writer.write_frame(frame)
-
-                if stop_event.is_set():
-                    break
-
-                if proc.poll() is not None:
-                    print(f"[WARN] {name}: ffmpeg to'xtab qoldi (code={proc.returncode})")
-                    break
-
-            terminate_process(proc, name)
-
-            with process_lock:
-                processes[name] = None
-
-            if not stop_event.is_set():
-                time.sleep(RECONNECT_DELAY)
-
-    finally:
-        if proc:
-            terminate_process(proc, name)
-        shm_writer.close()
-        shm_writer.unlink()
+        if not stop_event.is_set():
+            time.sleep(RECONNECT_DELAY)
 
 
 def stop_all(signum=None, frame=None):
@@ -389,7 +320,7 @@ def stop_all(signum=None, frame=None):
             terminate_process(proc, name)
 
     print("[INFO] Hamma jarayonlar to'xtatildi.")
-    raise SystemExit(0)
+    sys.exit(0)
 
 
 def main():
@@ -398,21 +329,34 @@ def main():
     signal.signal(signal.SIGINT, stop_all)
     signal.signal(signal.SIGTERM, stop_all)
 
-    print("[INFO] FFmpeg + MJPEG pipe + Shared Memory system boshlandi")
+    if not check_virtual_device_exists(OUT_VIRTUAL_VIDEO_DEVICE):
+        print(f"[ERROR] Virtual device topilmadi: {OUT_VIRTUAL_VIDEO_DEVICE}")
+        sys.exit(1)
+
+    if not check_virtual_device_exists(IN_VIRTUAL_VIDEO_DEVICE):
+        print(f"[ERROR] Virtual device topilmadi: {IN_VIRTUAL_VIDEO_DEVICE}")
+        sys.exit(1)
+
+    print("[INFO] Auto-reconnect recording system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
-    print(f"[INFO] SHM size: {SHM_WIDTH}x{SHM_HEIGHT}")
-    print(f"[INFO] PIPE FPS: {PIPE_FPS}")
+    print(f"[INFO] Virtual stream: {VIRTUAL_WIDTH}x{VIRTUAL_HEIGHT} @ {VIRTUAL_FPS} fps")
+    print("[INFO] Kamera sug'urilsa, dastur kutadi va qayta tiqilganda avtomatik ishga tushadi")
+    print("[INFO] Har yozilgan video DB ga saqlanadi")
+    print("[INFO] OUT va IN bir vaqtdagi segmentlar bir xil globalVideoId oladi")
+    print("[INFO] To'xtatish uchun CTRL+C bosing\n")
 
     db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
+
     out_thread = threading.Thread(
-        target=ffmpeg_camera_worker,
-        args=("OUT", OUT_VIDEO_DEVICE, OUT_AUDIO_DEVICE, "out_camera_shm"),
+        target=camera_worker,
+        args=("OUT", OUT_VIDEO_DEVICE, OUT_AUDIO_DEVICE, OUT_VIRTUAL_VIDEO_DEVICE),
         daemon=True
     )
+
     in_thread = threading.Thread(
-        target=ffmpeg_camera_worker,
-        args=("IN", IN_VIDEO_DEVICE, IN_AUDIO_DEVICE, "in_camera_shm"),
+        target=camera_worker,
+        args=("IN", IN_VIDEO_DEVICE, IN_AUDIO_DEVICE, IN_VIRTUAL_VIDEO_DEVICE),
         daemon=True
     )
 
