@@ -77,7 +77,7 @@ def build_ffmpeg_command(
         "-i", video_device,
 
         # AUDIO INPUT
-        "-thread_queue_size", "1024",
+        "-thread_queue_size", "64",
         "-f", "alsa",
         "-channels", channels,
         "-sample_rate", sample_rate,
@@ -100,9 +100,8 @@ def build_ffmpeg_command(
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
-        "-b:a", "96k",
-        "-ar", "44100",
-        "-af", "aresample=async=1000:min_hard_comp=0.100:first_pts=0",
+        "-b:a", "64k",
+        "-af", "aresample=async=1:first_pts=0",
 
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
