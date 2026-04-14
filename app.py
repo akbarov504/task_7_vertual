@@ -34,7 +34,7 @@ RECONNECT_DELAY    = 3
 DB_SCAN_INTERVAL   = 2
 FILE_STABLE_SECONDS = 2
 
-VIDEO_ID_NAMESPACE = uuid.UUID("12345678-1234-5678-1234-567812345678")
+VIDEO_ID_NAMESPACE = "TRUCK_VIN"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -193,7 +193,7 @@ def make_global_video_id(segment_key: str) -> str:
     Bir xil segment_key => bir xil globalVideoId.
     OUT va IN bir vaqtda yozilgan bo'lsa, ikkalasiga ham bir xil ID.
     """
-    return str(uuid.uuid5(VIDEO_ID_NAMESPACE, segment_key))
+    return str(VIDEO_ID_NAMESPACE + "_" + segment_key)
 
 
 def is_file_stable(file_path: str, stable_seconds: int = FILE_STABLE_SECONDS) -> bool:
