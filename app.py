@@ -60,17 +60,21 @@ def build_ffmpeg_command(
         "-hide_banner",
         "-loglevel", "warning",
 
-        "-fflags", "nobuffer+genpts",
-        "-flags", "low_delay",
-        "-avioflags", "direct",
-        "-probesize", "32",
-        "-analyzeduration", "0",
+        "-fflags", "+genpts",
+        "-probesize", "5M",
+        "-analyzeduration", "5M",
 
         "-thread_queue_size", "4096",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
+        
+        # =========================================================
+        # SEHRLI TAYOQCHA: KAMERA SOATINI EMAS KOMPYUTER SOATINI ISHLATISH
+        "-use_wallclock_as_timestamps", "1",
+        # =========================================================
+        
         "-i", video_device,
 
         "-thread_queue_size", "4096",
@@ -91,7 +95,12 @@ def build_ffmpeg_command(
         "-g", str(FPS * SEGMENT_TIME),
         "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
-        "-bufsize", "1800k",
+        "-bufsize", "3600k",
+        
+        # Tushib qolgan kadrlarni (frame drop) avtomatik to'ldirib, stabil FPS qilish
+        "-r", str(FPS),
+        "-fps_mode", "cfr",
+        
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
@@ -104,6 +113,7 @@ def build_ffmpeg_command(
         "-segment_format", "mp4",
         "-reset_timestamps", "1",
         "-strftime", "1",
+        "-movflags", "+faststart+empty_moov",
         timestamp_pattern,
     ]
 
