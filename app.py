@@ -36,42 +36,92 @@ FILE_STABLE_SECONDS = 2
 
 VIDEO_ID_NAMESPACE = "TRUCK_VIN"
 
+# Sync tuning
+PREPARE_AHEAD_SECONDS = 2.0          # keyingi boundary dan oldin tayyor turish
+COARSE_SLEEP_THRESHOLD = 0.050       # 50 ms dan katta bo'lsa sleep
+FINE_SLEEP_THRESHOLD = 0.005         # 5 ms dan katta bo'lsa short sleep
+BARRIER_TIMEOUT = 10                 # sekund
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 stop_event = threading.Event()
 processes = {}
 process_lock = threading.Lock()
 
+sync_state_lock = threading.Lock()
+sync_barrier = None
+sync_target_ts = None
 
-def get_next_aligned_time(segment_seconds: int) -> float:
-    """
-    Hozirgi vaqtdan keyingi eng yaqin segment boundary ni qaytaradi.
-    Masalan segment=10 bo'lsa:
-    10:29:26 -> 10:29:30
-    10:29:31 -> 10:29:40
-    """
-    now = time.time()
-    return math.ceil(now / segment_seconds) * segment_seconds
+
+def now_ts() -> float:
+    return time.time()
 
 
 def format_ts(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    dt = datetime.fromtimestamp(ts)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond:06d}"
 
 
-def wait_until(target_ts: float, name: str = "SYSTEM"):
+def get_next_aligned_time(segment_seconds: int, after_ts: float = None) -> float:
+    """
+    Keyingi segment boundary.
+    10s uchun:
+      10:29:26.1 -> 10:29:30
+      10:29:30.0 -> 10:29:40
+    """
+    if after_ts is None:
+        after_ts = now_ts()
+
+    eps = 1e-9
+    return math.floor((after_ts + segment_seconds - eps) / segment_seconds) * segment_seconds
+
+
+def get_or_create_sync_slot():
+    """
+    Har ikkala worker bir xil target_ts va bir xil barrier oladi.
+    """
+    global sync_barrier, sync_target_ts
+
+    with sync_state_lock:
+        current = now_ts()
+
+        if sync_target_ts is None or current >= sync_target_ts + 0.001:
+            sync_target_ts = get_next_aligned_time(SEGMENT_TIME, current + PREPARE_AHEAD_SECONDS)
+            sync_barrier = threading.Barrier(2)
+            print(f"[SYNC] Yangi sync slot yaratildi -> {format_ts(sync_target_ts)}")
+
+        return sync_target_ts, sync_barrier
+
+
+def wait_until_precise(target_ts: float, name: str):
+    """
+    Target vaqtga imkon qadar aniq yetib borish:
+    - uzoq bo'lsa sleep
+    - yaqinlashsa short sleep
+    - ohirida busy-wait
+    """
     while not stop_event.is_set():
-        now = time.time()
-        remain = target_ts - now
+        remaining = target_ts - now_ts()
 
-        if remain <= 0:
-            return
+        if remaining <= 0:
+            break
 
-        if remain > 1:
-            print(f"[INFO] {name}: startgacha {remain:.1f}s qoldi -> {format_ts(target_ts)}")
-            time.sleep(min(1, remain))
+        if remaining > COARSE_SLEEP_THRESHOLD:
+            time.sleep(min(remaining / 2.0, 0.020))
+        elif remaining > FINE_SLEEP_THRESHOLD:
+            time.sleep(0.001)
         else:
-            time.sleep(remain)
-            return
+            # very fine busy wait
+            while not stop_event.is_set() and now_ts() < target_ts:
+                pass
+            break
+
+    actual = now_ts()
+    diff_us = int((actual - target_ts) * 1_000_000)
+    print(
+        f"[SYNC] {name}: target={format_ts(target_ts)} "
+        f"actual={format_ts(actual)} diff_us={diff_us}"
+    )
 
 
 def build_ffmpeg_command(
@@ -118,7 +168,7 @@ def build_ffmpeg_command(
         "-max_muxing_queue_size", "256",
     ]
 
-    # 1) RECORDING OUTPUT
+    # RECORDING OUTPUT
     cmd += [
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -129,8 +179,6 @@ def build_ffmpeg_command(
         "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
         "-bufsize", "1800k",
-
-        # Har 10 soniyada keyframe
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
@@ -141,13 +189,13 @@ def build_ffmpeg_command(
         "-segment_time", str(SEGMENT_TIME),
         "-segment_atclocktime", "1",
         "-segment_clocktime_offset", "0",
-        "-strftime", "1",
-        "-reset_timestamps", "1",
         "-segment_format", "mp4",
+        "-reset_timestamps", "1",
+        "-strftime", "1",
         timestamp_pattern,
     ]
 
-    # 2) VIRTUAL CAMERA OUTPUT
+    # VIRTUAL CAMERA OUTPUT
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
@@ -221,10 +269,6 @@ def parse_segment_times_from_filename(file_name: str):
 
 
 def make_global_video_id(segment_key: str) -> str:
-    """
-    Bir xil segment_key => bir xil globalVideoId.
-    OUT va IN bir vaqtda yozilgan bo'lsa, ikkalasiga ham bir xil ID.
-    """
     return str(VIDEO_ID_NAMESPACE + "_" + segment_key)
 
 
@@ -290,6 +334,41 @@ def scan_and_insert_segments():
         time.sleep(DB_SCAN_INTERVAL)
 
 
+def synchronized_start(name, cmd):
+    """
+    Har ikki worker:
+    1) Bir xil sync slot oladi
+    2) Barrier da kutadi
+    3) Target time ga juda yaqin aniq kutadi
+    4) Popen qiladi
+    """
+    target_ts, barrier = get_or_create_sync_slot()
+    print(f"[SYNC] {name}: slot={format_ts(target_ts)} barrier kutmoqda")
+
+    try:
+        barrier.wait(timeout=BARRIER_TIMEOUT)
+    except threading.BrokenBarrierError:
+        print(f"[WARN] {name}: barrier buzildi, qayta uriniladi")
+        return None
+
+    wait_until_precise(target_ts, name)
+
+    if stop_event.is_set():
+        return None
+
+    popen_before = now_ts()
+    proc = subprocess.Popen(cmd)
+    popen_after = now_ts()
+
+    print(
+        f"[SYNC] {name}: popen_before={format_ts(popen_before)} "
+        f"popen_after={format_ts(popen_after)} "
+        f"delta_us={int((popen_after - target_ts) * 1_000_000)}"
+    )
+
+    return proc
+
+
 def camera_worker(name, video_device, audio_device, virtual_video_device):
     global processes
 
@@ -307,14 +386,6 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             time.sleep(RECONNECT_DELAY)
             continue
 
-        # Har safar restart bo'lsa ham keyingi 10-lik boundary da boshlaydi
-        next_start_ts = get_next_aligned_time(SEGMENT_TIME)
-        print(f"[INFO] {name}: keyingi aligned start -> {format_ts(next_start_ts)}")
-        wait_until(next_start_ts, name)
-
-        if stop_event.is_set():
-            break
-
         cmd = build_ffmpeg_command(
             video_device=video_device,
             audio_device=audio_device,
@@ -324,15 +395,22 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             virtual_video_device=virtual_video_device
         )
 
-        print(f"[INFO] {name}: ffmpeg ishga tushirildi @ {format_ts(time.time())}")
+        print(f"[INFO] {name}: ffmpeg tayyorlandi")
         print(f"[INFO] {name}: VIDEO={video_device}")
         print(f"[INFO] {name}: AUDIO={audio_device}")
         print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
 
-        proc = subprocess.Popen(cmd)
+        proc = synchronized_start(name, cmd)
+
+        if proc is None:
+            if not stop_event.is_set():
+                time.sleep(0.2)
+            continue
 
         with process_lock:
             processes[name] = proc
+
+        print(f"[INFO] {name}: ffmpeg ishga tushdi PID={proc.pid}")
 
         while not stop_event.is_set():
             ret = proc.poll()
@@ -376,7 +454,7 @@ def main():
         print(f"[ERROR] Virtual device topilmadi: {IN_VIRTUAL_VIDEO_DEVICE}")
         sys.exit(1)
 
-    next_start_ts = get_next_aligned_time(SEGMENT_TIME)
+    first_slot = get_next_aligned_time(SEGMENT_TIME, now_ts() + PREPARE_AHEAD_SECONDS)
 
     print("[INFO] Auto-reconnect recording system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
@@ -385,7 +463,7 @@ def main():
     print("[INFO] Kamera sug'urilsa, dastur kutadi va qayta tiqilganda avtomatik ishga tushadi")
     print("[INFO] Har yozilgan video DB ga saqlanadi")
     print("[INFO] OUT va IN bir vaqtdagi segmentlar bir xil globalVideoId oladi")
-    print(f"[INFO] Birinchi aligned start vaqti: {format_ts(next_start_ts)}")
+    print(f"[INFO] Birinchi sync slot: {format_ts(first_slot)}")
     print("[INFO] To'xtatish uchun CTRL+C bosing\n")
 
     db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
