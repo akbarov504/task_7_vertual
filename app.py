@@ -70,10 +70,7 @@ def build_ffmpeg_command(
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         
-        # =========================================================
-        # SEHRLI TAYOQCHA: KAMERA SOATINI EMAS KOMPYUTER SOATINI ISHLATISH
         "-use_wallclock_as_timestamps", "1",
-        # =========================================================
         
         "-i", video_device,
 
@@ -97,7 +94,6 @@ def build_ffmpeg_command(
         "-maxrate", "1800k",
         "-bufsize", "3600k",
         
-        # Tushib qolgan kadrlarni (frame drop) avtomatik to'ldirib, stabil FPS qilish
         "-r", str(FPS),
         "-fps_mode", "cfr",
         
@@ -173,9 +169,6 @@ def parse_segment_times_from_filename(file_name: str):
 
     try:
         actual_dt = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
-        
-        # Matematik yaxlitlash (snap-to-grid). 
-        # Agar vaqt 11, 12 sekund bo'lsa uni aniq 10 ga; 31, 32 ni esa 30 ga qaytaradi.
         actual_ts = actual_dt.timestamp()
         rounded_ts = (int(actual_ts) // SEGMENT_TIME) * SEGMENT_TIME
         slot_dt = datetime.fromtimestamp(rounded_ts)
@@ -221,7 +214,6 @@ def scan_and_insert_segments():
             for file_name in files:
                 file_path = os.path.join(OUTPUT_DIR, file_name)
 
-                # Agar eski fayl allaqachon tekshirilgan bo'lsa
                 if video_exists(file_path):
                     continue
 
@@ -234,11 +226,9 @@ def scan_and_insert_segments():
                 if not camera_type:
                     continue
 
-                # Mukammal fayl nomini yig'amiz (sinxronlangan)
                 ideal_file_name = f"{camera_type}_{segment_key}.mp4"
                 ideal_file_path = os.path.join(OUTPUT_DIR, ideal_file_name)
 
-                # Agar FFmpeg nomni adashib 1 sekundga farqli yozgan bo'lsa, faylni nomini o'zgartiramiz!
                 if file_name != ideal_file_name:
                     try:
                         os.rename(file_path, ideal_file_path)
@@ -248,7 +238,6 @@ def scan_and_insert_segments():
                         print(f"[ERROR] Fayl nomini o'zgartirishda xato: {e}")
                         continue
 
-                # Yangilangan nom bazada bor-yo'qligini tekshiramiz
                 if video_exists(file_path):
                     continue
 
