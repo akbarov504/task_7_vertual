@@ -234,7 +234,6 @@ def scan_and_insert_segments():
                 print(
                     f"[DB] Video saqlandi: "
                     f"camera_type={camera_type}, "
-                    f"file_path={file_path}, "
                     f"globalVideoId={global_video_id}"
                 )
 
@@ -242,6 +241,16 @@ def scan_and_insert_segments():
             print(f"[DB WATCHER ERROR] {e}")
 
         time.sleep(DB_SCAN_INTERVAL)
+
+def wait_for_sync(segment_time):
+    """
+    Keyingi segment boshlanish vaqtini hisoblab,
+    o'sha vaqt kelguncha thread'ni uxlatib turadi.
+    """
+    now = time.time()
+    next_boundary = ((int(now) // segment_time) + 1) * segment_time
+    sleep_time = next_boundary - now + 0.1 
+    time.sleep(sleep_time)
 
 def camera_worker(name, video_device, audio_device, virtual_video_device):
     global processes
@@ -269,11 +278,15 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             virtual_video_device=virtual_video_device
         )
 
-        print(f"[INFO] {name}: ffmpeg ishga tushirildi")
+        print(f"[INFO] {name}: ffmpeg sozlamalari tayyorlandi")
         print(f"[INFO] {name}: VIDEO={video_device}")
         print(f"[INFO] {name}: AUDIO={audio_device}")
         print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
 
+        print(f"[INFO] {name}: Sinxron boshlash uchun vaqt kutilmoqda...")
+        wait_for_sync(SEGMENT_TIME)
+
+        print(f"[INFO] {name}: ffmpeg ishga tushirildi!")
         proc = subprocess.Popen(cmd)
 
         with process_lock:
@@ -347,7 +360,10 @@ def main():
     in_thread.start()
 
     while True:
-        time.sleep(1)
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            stop_all()
 
 if __name__ == "__main__":
     main()
