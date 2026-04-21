@@ -4,7 +4,7 @@ import signal
 import sys
 import time
 import threading
-import uuid
+import math
 from datetime import datetime, timedelta
 
 from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
@@ -17,30 +17,61 @@ IN_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.10.auto-usb-0:1:1.0-video-
 IN_AUDIO_DEVICE = "hw:Camera,0"
 
 OUT_VIRTUAL_VIDEO_DEVICE = "/dev/video40"
-IN_VIRTUAL_VIDEO_DEVICE  = "/dev/video41"
+IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
 
-OUTPUT_DIR   = LOCAL_PATH
+OUTPUT_DIR = LOCAL_PATH
 SEGMENT_TIME = VIDEO_SEGMENT_LEN
 
-WIDTH  = 1920
+WIDTH = 1920
 HEIGHT = 1080
-FPS    = 20
+FPS = 20
 
-VIRTUAL_WIDTH  = 640
+VIRTUAL_WIDTH = 640
 VIRTUAL_HEIGHT = 640
-VIRTUAL_FPS    = 20
+VIRTUAL_FPS = 20
 
-RECONNECT_DELAY    = 3
-DB_SCAN_INTERVAL   = 2
+RECONNECT_DELAY = 3
+DB_SCAN_INTERVAL = 2
 FILE_STABLE_SECONDS = 2
 
 VIDEO_ID_NAMESPACE = "TRUCK_VIN"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-stop_event   = threading.Event()
-processes    = {}
+stop_event = threading.Event()
+processes = {}
 process_lock = threading.Lock()
+
+
+def get_next_aligned_time(segment_seconds: int) -> float:
+    """
+    Hozirgi vaqtdan keyingi eng yaqin segment boundary ni qaytaradi.
+    Masalan segment=10 bo'lsa:
+    10:29:26 -> 10:29:30
+    10:29:31 -> 10:29:40
+    """
+    now = time.time()
+    return math.ceil(now / segment_seconds) * segment_seconds
+
+
+def format_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def wait_until(target_ts: float, name: str = "SYSTEM"):
+    while not stop_event.is_set():
+        now = time.time()
+        remain = target_ts - now
+
+        if remain <= 0:
+            return
+
+        if remain > 1:
+            print(f"[INFO] {name}: startgacha {remain:.1f}s qoldi -> {format_ts(target_ts)}")
+            time.sleep(min(1, remain))
+        else:
+            time.sleep(remain)
+            return
 
 
 def build_ffmpeg_command(
@@ -98,6 +129,8 @@ def build_ffmpeg_command(
         "-keyint_min", str(FPS * SEGMENT_TIME),
         "-maxrate", "1800k",
         "-bufsize", "1800k",
+
+        # Har 10 soniyada keyframe
         "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_TIME})",
 
         "-c:a", "aac",
@@ -107,24 +140,23 @@ def build_ffmpeg_command(
         "-f", "segment",
         "-segment_time", str(SEGMENT_TIME),
         "-segment_atclocktime", "1",
-        "-segment_format", "mp4",
-        "-reset_timestamps", "1",
+        "-segment_clocktime_offset", "0",
         "-strftime", "1",
+        "-reset_timestamps", "1",
+        "-segment_format", "mp4",
         timestamp_pattern,
     ]
 
-    # 2) VIRTUAL CAMERA OUTPUT (1280x720 @ 15fps)
+    # 2) VIRTUAL CAMERA OUTPUT
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
             "-an",
-
             "-vf", (
                 f"fps={VIRTUAL_FPS},"
                 f"scale={VIRTUAL_WIDTH}:{VIRTUAL_HEIGHT}:flags=fast_bilinear,"
                 f"format=yuv420p"
             ),
-
             "-pix_fmt", "yuv420p",
             "-f", "v4l2",
             virtual_video_device,
@@ -165,9 +197,9 @@ def parse_segment_times_from_filename(file_name: str):
       OUT_2026-04-09_13-10-00.mp4
       IN_2026-04-09_13-10-00.mp4
     """
-    base_name        = os.path.basename(file_name)
+    base_name = os.path.basename(file_name)
     name_without_ext = os.path.splitext(base_name)[0]
-    parts            = name_without_ext.split("_", 1)
+    parts = name_without_ext.split("_", 1)
 
     if len(parts) != 2:
         return None, None, None, None
@@ -175,8 +207,8 @@ def parse_segment_times_from_filename(file_name: str):
     camera_type, dt_part = parts
 
     try:
-        start_dt    = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
-        end_dt      = start_dt + timedelta(seconds=SEGMENT_TIME)
+        start_dt = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
+        end_dt = start_dt + timedelta(seconds=SEGMENT_TIME)
         segment_key = dt_part
         return (
             camera_type,
@@ -229,8 +261,7 @@ def scan_and_insert_segments():
                 if not is_file_stable(file_path):
                     continue
 
-                camera_type, start_time, end_time, segment_key = \
-                    parse_segment_times_from_filename(file_name)
+                camera_type, start_time, end_time, segment_key = parse_segment_times_from_filename(file_name)
 
                 if not camera_type or not start_time or not end_time or not segment_key:
                     print(f"[WARN] DB watcher: filename parse bo'lmadi -> {file_name}")
@@ -263,7 +294,7 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
     global processes
 
     while not stop_event.is_set():
-        video_ok   = check_video_device_exists(video_device)
+        video_ok = check_video_device_exists(video_device)
         virtual_ok = check_virtual_device_exists(virtual_video_device)
 
         if not video_ok:
@@ -276,6 +307,14 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             time.sleep(RECONNECT_DELAY)
             continue
 
+        # Har safar restart bo'lsa ham keyingi 10-lik boundary da boshlaydi
+        next_start_ts = get_next_aligned_time(SEGMENT_TIME)
+        print(f"[INFO] {name}: keyingi aligned start -> {format_ts(next_start_ts)}")
+        wait_until(next_start_ts, name)
+
+        if stop_event.is_set():
+            break
+
         cmd = build_ffmpeg_command(
             video_device=video_device,
             audio_device=audio_device,
@@ -285,7 +324,7 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
             virtual_video_device=virtual_video_device
         )
 
-        print(f"[INFO] {name}: ffmpeg ishga tushirildi")
+        print(f"[INFO] {name}: ffmpeg ishga tushirildi @ {format_ts(time.time())}")
         print(f"[INFO] {name}: VIDEO={video_device}")
         print(f"[INFO] {name}: AUDIO={audio_device}")
         print(f"[INFO] {name}: VIRTUAL={virtual_video_device}")
@@ -337,6 +376,8 @@ def main():
         print(f"[ERROR] Virtual device topilmadi: {IN_VIRTUAL_VIDEO_DEVICE}")
         sys.exit(1)
 
+    next_start_ts = get_next_aligned_time(SEGMENT_TIME)
+
     print("[INFO] Auto-reconnect recording system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
@@ -344,6 +385,7 @@ def main():
     print("[INFO] Kamera sug'urilsa, dastur kutadi va qayta tiqilganda avtomatik ishga tushadi")
     print("[INFO] Har yozilgan video DB ga saqlanadi")
     print("[INFO] OUT va IN bir vaqtdagi segmentlar bir xil globalVideoId oladi")
+    print(f"[INFO] Birinchi aligned start vaqti: {format_ts(next_start_ts)}")
     print("[INFO] To'xtatish uchun CTRL+C bosing\n")
 
     db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
