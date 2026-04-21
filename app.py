@@ -5,6 +5,7 @@ import sys
 import time
 import threading
 import math
+import ctypes
 from datetime import datetime, timedelta
 
 from config import LOCAL_PATH, VIDEO_SEGMENT_LEN
@@ -17,30 +18,29 @@ IN_VIDEO_DEVICE = "/dev/v4l/by-path/platform-xhci-hcd.10.auto-usb-0:1:1.0-video-
 IN_AUDIO_DEVICE = "hw:Camera,0"
 
 OUT_VIRTUAL_VIDEO_DEVICE = "/dev/video40"
-IN_VIRTUAL_VIDEO_DEVICE = "/dev/video41"
+IN_VIRTUAL_VIDEO_DEVICE  = "/dev/video41"
 
-OUTPUT_DIR = LOCAL_PATH
+OUTPUT_DIR   = LOCAL_PATH
 SEGMENT_TIME = VIDEO_SEGMENT_LEN
 
-WIDTH = 1920
+WIDTH  = 1920
 HEIGHT = 1080
-FPS = 20
+FPS    = 20
 
-VIRTUAL_WIDTH = 640
+VIRTUAL_WIDTH  = 640
 VIRTUAL_HEIGHT = 640
-VIRTUAL_FPS = 20
+VIRTUAL_FPS    = 20
 
-RECONNECT_DELAY = 3
-DB_SCAN_INTERVAL = 2
+RECONNECT_DELAY     = 3
+DB_SCAN_INTERVAL    = 2
 FILE_STABLE_SECONDS = 2
 
 VIDEO_ID_NAMESPACE = "TRUCK_VIN"
 
 # Sync tuning
 PREPARE_AHEAD_SECONDS  = 2.0    # keyingi boundary dan oldin tayyor turish
-COARSE_SLEEP_THRESHOLD = 0.050  # 50 ms dan katta bo'lsa sleep
-FINE_SLEEP_THRESHOLD   = 0.005  # 5 ms dan katta bo'lsa short sleep
-BARRIER_TIMEOUT        = 10     # sekund
+COARSE_SLEEP_THRESHOLD = 0.050  # 50ms dan katta bo'lsa sleep
+FINE_SLEEP_THRESHOLD   = 0.002  # 2ms dan katta bo'lsa short sleep
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -48,11 +48,15 @@ stop_event   = threading.Event()
 processes    = {}
 process_lock = threading.Lock()
 
-# Sync state — ikkala camera_worker bir xil slot ishlatishi uchun
-sync_state_lock  = threading.Lock()
-sync_target_ts   = None   # hozirgi maqsad vaqt
-sync_barrier_pre = None   # 1-chi: ikkalasi tayyor bo'lgach precise-wait boshlash
-sync_barrier_go  = None   # 2-chi: ikkalasi precise-wait tugagach Popen qilish
+# ── Shared launch gate ─────────────────────────────────────────────────────────
+# Ikkala worker ham CMD ni tayyor qilib, gate da kutadi.
+# Gate to'lishi bilan (ikkalasi tayyor) birgalikda Popen qiladi.
+_gate_lock    = threading.Lock()
+_gate_target  = None    # float  – maqsad epoch (sekund)
+_gate_cmds    = {}      # {name: cmd}
+_gate_event   = threading.Event()   # "ot!" signali
+_gate_names   = set()   # kutayotgan workerlar
+_GATE_WORKERS = 2       # nechta worker kutadi
 
 
 def now_ts() -> float:
@@ -65,71 +69,91 @@ def format_ts(ts: float) -> str:
 
 
 def get_next_aligned_time(segment_seconds: int, after_ts: float = None) -> float:
-    """
-    Keyingi segment boundary.
-    10s uchun:
-      10:29:26.1 -> 10:29:30
-      10:29:30.0 -> 10:29:40
-    """
     if after_ts is None:
         after_ts = now_ts()
-
     eps = 1e-9
     return math.floor((after_ts + segment_seconds - eps) / segment_seconds) * segment_seconds
 
 
-def get_or_create_sync_slot():
-    """
-    Har ikkala worker bir xil target_ts, barrier_pre va barrier_go oladi.
-
-    Yangi slot faqat hozirgi target o'tib ketganda yaratiladi —
-    shunda bir worker reconnect qilganda ham har ikkalasi
-    KEYINGI bir xil boundary ga tushadi.
-    """
-    global sync_target_ts, sync_barrier_pre, sync_barrier_go
-
-    with sync_state_lock:
-        current = now_ts()
-
-        # Slot yo'q yoki o'tib ketgan bo'lsa — yangisini yaratamiz
-        if sync_target_ts is None or current >= sync_target_ts - 0.001:
-            sync_target_ts   = get_next_aligned_time(SEGMENT_TIME, current + PREPARE_AHEAD_SECONDS)
-            sync_barrier_pre = threading.Barrier(2)   # precise-wait ga kirish eshigi
-            sync_barrier_go  = threading.Barrier(2)   # Popen ga kirish eshigi
-            print(f"[SYNC] Yangi sync slot -> {format_ts(sync_target_ts)}")
-
-        return sync_target_ts, sync_barrier_pre, sync_barrier_go
-
-
 def wait_until_precise(target_ts: float, name: str):
     """
-    Target vaqtga imkon qadar aniq yetib borish:
-    - uzoq bo'lsa sleep
-    - yaqinlashsa short sleep
-    - ohirida busy-wait
+    Target vaqtga imkon qadar aniq yetib borish.
     """
     while not stop_event.is_set():
         remaining = target_ts - now_ts()
-
         if remaining <= 0:
             break
-
         if remaining > COARSE_SLEEP_THRESHOLD:
-            time.sleep(min(remaining / 2.0, 0.020))
+            time.sleep(min(remaining * 0.8, 0.020))
         elif remaining > FINE_SLEEP_THRESHOLD:
             time.sleep(0.001)
         else:
-            # very fine busy wait
             while not stop_event.is_set() and now_ts() < target_ts:
                 pass
             break
 
-    actual = now_ts()
-    diff_us = int((actual - target_ts) * 1_000_000)
-    print(
-        f"[SYNC] {name}: target={format_ts(target_ts)} "
-        f"actual={format_ts(actual)} diff_us={diff_us}"
-    )
+    actual   = now_ts()
+    diff_us  = int((actual - target_ts) * 1_000_000)
+    print(f"[SYNC] {name}: target={format_ts(target_ts)} actual={format_ts(actual)} diff_us={diff_us}")
+
+
+# ── Launch gate helpers ────────────────────────────────────────────────────────
+
+def _reset_gate(target_ts: float):
+    """Gate ni yangilash (lock ostida chaqiriladi)."""
+    global _gate_target, _gate_cmds, _gate_event, _gate_names
+    _gate_target = target_ts
+    _gate_cmds   = {}
+    _gate_names  = set()
+    _gate_event  = threading.Event()
+    print(f"[GATE] Yangi gate -> {format_ts(target_ts)}")
+
+
+def register_and_wait(name: str, cmd: list) -> "subprocess.Popen | None":
+    """
+    Worker o'z cmd ni ro'yxatdan o'tkazadi va gate ochilishini kutadi.
+
+    Gate IKKI worker ro'yxatdan o'tganda ochiladi.
+    Birinchi kelgan worker target_ts ni hisoblaydi va kutadi.
+    Ikkinchi kelgan worker gate ni ochadi — ikkalasi birgalikda Popen qiladi.
+    Agar bitta worker uzilib qolsa va faqat bitta worker bo'lsa,
+    u PREPARE_AHEAD_SECONDS + SEGMENT_TIME dan keyin yolg'iz ishlaydi.
+    """
+    global _gate_target, _gate_cmds, _gate_names, _gate_event
+
+    with _gate_lock:
+        current = now_ts()
+
+        # Eski gate o'tib ketganmi yoki yo'qmi — yangilash
+        if _gate_target is None or current >= _gate_target:
+            _reset_gate(get_next_aligned_time(SEGMENT_TIME, current + PREPARE_AHEAD_SECONDS))
+
+        target_ts   = _gate_target
+        gate_event  = _gate_event
+        _gate_cmds[name]  = cmd
+        _gate_names.add(name)
+        ready_count = len(_gate_names)
+
+    print(f"[GATE] {name}: ro'yxatdan o'tdi ({ready_count}/{_GATE_WORKERS}) target={format_ts(target_ts)}")
+
+    if ready_count >= _GATE_WORKERS:
+        # Ikkinchi worker — gate ni ochamiz
+        wait_until_precise(target_ts, name)
+        gate_event.set()
+    else:
+        # Birinchi worker — gate ochilishini kutamiz
+        # Timeout = target + SEGMENT_TIME (agar ikkinchi kamera uzilgan bo'lsa)
+        timeout = (target_ts - now_ts()) + SEGMENT_TIME
+        gate_event.wait(timeout=max(timeout, 1.0))
+        wait_until_precise(target_ts, name)
+
+    if stop_event.is_set():
+        return None
+
+    popen_ts = now_ts()
+    proc = subprocess.Popen(cmd)
+    print(f"[GATE] {name}: Popen delta_us={int((popen_ts - target_ts) * 1_000_000)} PID={proc.pid}")
+    return proc
 
 
 def build_ffmpeg_command(
@@ -158,22 +182,23 @@ def build_ffmpeg_command(
         "-probesize", "32",
         "-analyzeduration", "0",
 
-        # VIDEO INPUT
-        "-thread_queue_size", "1024",
+        # VIDEO INPUT — pixel format aniq belgilandi (warning 2 yo'qoladi)
+        "-thread_queue_size", "4096",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
         "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", video_device,
 
-        # AUDIO INPUT
-        "-thread_queue_size", "1024",
+        # AUDIO INPUT — channel_layout aniq belgilandi (warning 1 yo'qoladi)
+        "-thread_queue_size", "4096",
         "-f", "alsa",
         "-channels", channels,
         "-sample_rate", sample_rate,
+        "-channel_layout", "stereo" if channels == "2" else "mono",
         "-i", audio_device,
 
-        "-max_muxing_queue_size", "1024",
+        "-max_muxing_queue_size", "4096",
     ]
 
     # RECORDING OUTPUT
@@ -203,7 +228,7 @@ def build_ffmpeg_command(
         timestamp_pattern,
     ]
 
-    # VIRTUAL CAMERA OUTPUT
+    # VIRTUAL CAMERA OUTPUT — pixel format aniq (warning 2 yo'qoladi)
     if virtual_video_device:
         cmd += [
             "-map", "0:v:0",
@@ -214,6 +239,7 @@ def build_ffmpeg_command(
                 f"format=yuv420p"
             ),
             "-pix_fmt", "yuv420p",
+            "-color_range", "tv",
             "-f", "v4l2",
             virtual_video_device,
         ]
@@ -343,47 +369,8 @@ def scan_and_insert_segments():
 
 
 def synchronized_start(name, cmd):
-    """
-    Ikki bosqichli sync:
-      1) barrier_pre  — ikkalasi ham tayyor bo'lganda precise-wait boshlanadi
-      2) wait_until_precise — GIL tufayli biri oldin tugasa ham ketmaydi
-      3) barrier_go   — IKKALASI precise-wait ni tugatgach BIRGALIKDA Popen qiladi
-
-    Natijada Popen lar orasidagi farq faqat OS scheduling latency (~0-200 us).
-    """
-    target_ts, barrier_pre, barrier_go = get_or_create_sync_slot()
-    print(f"[SYNC] {name}: slot={format_ts(target_ts)} | barrier_pre kutmoqda...")
-
-    # --- 1-chi eshik: ikkalasi tayyor ---
-    try:
-        barrier_pre.wait(timeout=BARRIER_TIMEOUT)
-    except threading.BrokenBarrierError:
-        print(f"[WARN] {name}: barrier_pre buzildi, qayta uriniladi")
-        return None
-
-    # --- Precise wait ---
-    wait_until_precise(target_ts, name)
-
-    if stop_event.is_set():
-        return None
-
-    # --- 2-chi eshik: ikkalasi precise-wait ni tugatdi ---
-    try:
-        barrier_go.wait(timeout=1.0)   # 1s timeout — biri kech qolsa kutmasin
-    except threading.BrokenBarrierError:
-        print(f"[WARN] {name}: barrier_go buzildi, yolg'iz davom etadi")
-
-    # --- Popen ---
-    popen_before = now_ts()
-    proc = subprocess.Popen(cmd)
-    popen_after  = now_ts()
-
-    print(
-        f"[SYNC] {name}: popen={format_ts(popen_before)} "
-        f"delta_us={int((popen_before - target_ts) * 1_000_000)}"
-    )
-
-    return proc
+    """register_and_wait ga yo'naltiruvchi wrapper — camera_worker o'zgarmaydi."""
+    return register_and_wait(name, cmd)
 
 
 def camera_worker(name, video_device, audio_device, virtual_video_device):
@@ -471,8 +458,6 @@ def main():
         print(f"[ERROR] Virtual device topilmadi: {IN_VIRTUAL_VIDEO_DEVICE}")
         sys.exit(1)
 
-    first_slot = get_next_aligned_time(SEGMENT_TIME, now_ts() + PREPARE_AHEAD_SECONDS)
-
     print("[INFO] Auto-reconnect recording system boshlandi")
     print(f"[INFO] Papka: {OUTPUT_DIR}")
     print(f"[INFO] Segment: {SEGMENT_TIME} sekund")
@@ -480,7 +465,6 @@ def main():
     print("[INFO] Kamera sug'urilsa, dastur kutadi va qayta tiqilganda avtomatik ishga tushadi")
     print("[INFO] Har yozilgan video DB ga saqlanadi")
     print("[INFO] OUT va IN bir vaqtdagi segmentlar bir xil globalVideoId oladi")
-    print(f"[INFO] Birinchi sync slot: {format_ts(first_slot)}")
     print("[INFO] To'xtatish uchun CTRL+C bosing\n")
 
     db_thread = threading.Thread(target=scan_and_insert_segments, daemon=True)
