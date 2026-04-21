@@ -151,8 +151,7 @@ def terminate_process(proc, name):
 def parse_segment_times_from_filename(file_name: str):
     """
     Format:
-      OUT_2026-04-09_13-10-00.mp4
-      IN_2026-04-09_13-10-00.mp4
+      OUT_2026-04-09_13-10-11.mp4  -> 13-10-10 ga yaxlitlanadi!
     """
     base_name        = os.path.basename(file_name)
     name_without_ext = os.path.splitext(base_name)[0]
@@ -163,15 +162,19 @@ def parse_segment_times_from_filename(file_name: str):
     camera_type, dt_part = parts
 
     try:
-        start_dt    = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
-        end_dt      = start_dt + timedelta(seconds=SEGMENT_TIME)
-        segment_key = dt_part
-        return (
-            camera_type,
-            start_dt.isoformat(),
-            end_dt.isoformat(),
-            segment_key
-        )
+        actual_dt = datetime.strptime(dt_part, "%Y-%m-%d_%H-%M-%S")
+        
+        # Matematik yaxlitlash (snap-to-grid). 
+        # Agar vaqt 11, 12 sekund bo'lsa uni aniq 10 ga; 31, 32 ni esa 30 ga qaytaradi.
+        actual_ts = actual_dt.timestamp()
+        rounded_ts = (int(actual_ts) // SEGMENT_TIME) * SEGMENT_TIME
+        slot_dt = datetime.fromtimestamp(rounded_ts)
+
+        segment_key = slot_dt.strftime("%Y-%m-%d_%H-%M-%S")
+        start_dt = slot_dt.isoformat()
+        end_dt   = (slot_dt + timedelta(seconds=SEGMENT_TIME)).isoformat()
+        
+        return camera_type, start_dt, end_dt, segment_key
     except ValueError:
         return None, None, None, None
 
@@ -208,6 +211,7 @@ def scan_and_insert_segments():
             for file_name in files:
                 file_path = os.path.join(OUTPUT_DIR, file_name)
 
+                # Agar eski fayl allaqachon tekshirilgan bo'lsa
                 if video_exists(file_path):
                     continue
 
@@ -217,8 +221,25 @@ def scan_and_insert_segments():
                 camera_type, start_time, end_time, segment_key = \
                     parse_segment_times_from_filename(file_name)
 
-                if not camera_type or not start_time or not end_time or not segment_key:
-                    print(f"[WARN] DB watcher: filename parse bo'lmadi -> {file_name}")
+                if not camera_type:
+                    continue
+
+                # Mukammal fayl nomini yig'amiz (sinxronlangan)
+                ideal_file_name = f"{camera_type}_{segment_key}.mp4"
+                ideal_file_path = os.path.join(OUTPUT_DIR, ideal_file_name)
+
+                # Agar FFmpeg nomni adashib 1 sekundga farqli yozgan bo'lsa, faylni nomini o'zgartiramiz!
+                if file_name != ideal_file_name:
+                    try:
+                        os.rename(file_path, ideal_file_path)
+                        file_path = ideal_file_path
+                        print(f"[INFO] Fayl vaqti sinxronlandi: {file_name} -> {ideal_file_name}")
+                    except Exception as e:
+                        print(f"[ERROR] Fayl nomini o'zgartirishda xato: {e}")
+                        continue
+
+                # Yangilangan nom bazada bor-yo'qligini tekshiramiz
+                if video_exists(file_path):
                     continue
 
                 global_video_id = make_global_video_id(segment_key)
