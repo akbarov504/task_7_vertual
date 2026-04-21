@@ -285,7 +285,8 @@ def camera_worker(name, video_device, audio_device, virtual_video_device):
                 print(f"[WARN] {name}: ffmpeg to'xtab qoldi (code={ret}). Qayta ulanish...")
                 break
             time.sleep(1)
-            terminate_process(proc, name)
+            
+        terminate_process(proc, name)
 
         with process_lock:
             processes[name] = None
