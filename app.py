@@ -37,15 +37,22 @@ FILE_STABLE_SECONDS = 2
 VIDEO_ID_NAMESPACE = "TRUCK_VIN"
 
 # Sync tuning
-PREPARE_AHEAD_SECONDS = 2.0          # keyingi boundary dan oldin tayyor turish
-COARSE_SLEEP_THRESHOLD = 0.050       # 50 ms dan katta bo'lsa sleep
-FINE_SLEEP_THRESHOLD = 0.005         # 5 ms dan katta bo'lsa short sleep
+PREPARE_AHEAD_SECONDS  = 2.0    # keyingi boundary dan oldin tayyor turish
+COARSE_SLEEP_THRESHOLD = 0.050  # 50 ms dan katta bo'lsa sleep
+FINE_SLEEP_THRESHOLD   = 0.005  # 5 ms dan katta bo'lsa short sleep
+BARRIER_TIMEOUT        = 10     # sekund
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-stop_event = threading.Event()
-processes = {}
+stop_event   = threading.Event()
+processes    = {}
 process_lock = threading.Lock()
+
+# Sync state — ikkala camera_worker bir xil slot ishlatishi uchun
+sync_state_lock  = threading.Lock()
+sync_target_ts   = None   # hozirgi maqsad vaqt
+sync_barrier_pre = None   # 1-chi: ikkalasi tayyor bo'lgach precise-wait boshlash
+sync_barrier_go  = None   # 2-chi: ikkalasi precise-wait tugagach Popen qilish
 
 
 def now_ts() -> float:
@@ -71,17 +78,27 @@ def get_next_aligned_time(segment_seconds: int, after_ts: float = None) -> float
     return math.floor((after_ts + segment_seconds - eps) / segment_seconds) * segment_seconds
 
 
-def get_next_sync_target() -> float:
+def get_or_create_sync_slot():
     """
-    Hozirgi vaqtdan PREPARE_AHEAD_SECONDS keyin bo'lgan
-    eng yaqin SEGMENT_TIME boundary ni qaytaradi.
+    Har ikkala worker bir xil target_ts, barrier_pre va barrier_go oladi.
 
-    Misol (SEGMENT_TIME=10, PREPARE_AHEAD_SECONDS=2):
-      10:29:26.1  ->  10:29:30
-      10:29:28.5  ->  10:29:40   (30 ga 1.5s qolgan, prepare uchun kam)
-      10:29:30.0  ->  10:29:40
+    Yangi slot faqat hozirgi target o'tib ketganda yaratiladi —
+    shunda bir worker reconnect qilganda ham har ikkalasi
+    KEYINGI bir xil boundary ga tushadi.
     """
-    return get_next_aligned_time(SEGMENT_TIME, now_ts() + PREPARE_AHEAD_SECONDS)
+    global sync_target_ts, sync_barrier_pre, sync_barrier_go
+
+    with sync_state_lock:
+        current = now_ts()
+
+        # Slot yo'q yoki o'tib ketgan bo'lsa — yangisini yaratamiz
+        if sync_target_ts is None or current >= sync_target_ts - 0.001:
+            sync_target_ts   = get_next_aligned_time(SEGMENT_TIME, current + PREPARE_AHEAD_SECONDS)
+            sync_barrier_pre = threading.Barrier(2)   # precise-wait ga kirish eshigi
+            sync_barrier_go  = threading.Barrier(2)   # Popen ga kirish eshigi
+            print(f"[SYNC] Yangi sync slot -> {format_ts(sync_target_ts)}")
+
+        return sync_target_ts, sync_barrier_pre, sync_barrier_go
 
 
 def wait_until_precise(target_ts: float, name: str):
@@ -142,7 +159,7 @@ def build_ffmpeg_command(
         "-analyzeduration", "0",
 
         # VIDEO INPUT
-        "-thread_queue_size", "64",
+        "-thread_queue_size", "1024",
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-framerate", str(FPS),
@@ -150,13 +167,13 @@ def build_ffmpeg_command(
         "-i", video_device,
 
         # AUDIO INPUT
-        "-thread_queue_size", "64",
+        "-thread_queue_size", "1024",
         "-f", "alsa",
         "-channels", channels,
         "-sample_rate", sample_rate,
         "-i", audio_device,
 
-        "-max_muxing_queue_size", "256",
+        "-max_muxing_queue_size", "1024",
     ]
 
     # RECORDING OUTPUT
@@ -327,31 +344,44 @@ def scan_and_insert_segments():
 
 def synchronized_start(name, cmd):
     """
-    Har ikki worker mustaqil holda bir xil clock boundary ni hisoblaydi
-    va aynan o'sha vaqtda ffmpeg ni ishga tushiradi.
+    Ikki bosqichli sync:
+      1) barrier_pre  — ikkalasi ham tayyor bo'lganda precise-wait boshlanadi
+      2) wait_until_precise — GIL tufayli biri oldin tugasa ham ketmaydi
+      3) barrier_go   — IKKALASI precise-wait ni tugatgach BIRGALIKDA Popen qiladi
 
-    Barrier shart emas - global clock ikkalasini ham bir vaqtga olib keladi.
-    Reconnect bo'lsa ham har doim to'g'ri keyingi boundary ga tushadi.
+    Natijada Popen lar orasidagi farq faqat OS scheduling latency (~0-200 us).
     """
-    target_ts = get_next_sync_target()
-    print(f"[SYNC] {name}: target={format_ts(target_ts)} ga kutmoqda")
+    target_ts, barrier_pre, barrier_go = get_or_create_sync_slot()
+    print(f"[SYNC] {name}: slot={format_ts(target_ts)} | barrier_pre kutmoqda...")
 
+    # --- 1-chi eshik: ikkalasi tayyor ---
+    try:
+        barrier_pre.wait(timeout=BARRIER_TIMEOUT)
+    except threading.BrokenBarrierError:
+        print(f"[WARN] {name}: barrier_pre buzildi, qayta uriniladi")
+        return None
+
+    # --- Precise wait ---
     wait_until_precise(target_ts, name)
 
     if stop_event.is_set():
         return None
 
+    # --- 2-chi eshik: ikkalasi precise-wait ni tugatdi ---
+    try:
+        barrier_go.wait(timeout=1.0)   # 1s timeout — biri kech qolsa kutmasin
+    except threading.BrokenBarrierError:
+        print(f"[WARN] {name}: barrier_go buzildi, yolg'iz davom etadi")
+
+    # --- Popen ---
     popen_before = now_ts()
     proc = subprocess.Popen(cmd)
-    popen_after = now_ts()
+    popen_after  = now_ts()
 
     print(
-        f"[SYNC] {name}: popen_before={format_ts(popen_before)} "
-        f"popen_after={format_ts(popen_after)} "
-        f"delta_us={int((popen_after - target_ts) * 1_000_000)}"
+        f"[SYNC] {name}: popen={format_ts(popen_before)} "
+        f"delta_us={int((popen_before - target_ts) * 1_000_000)}"
     )
-
-    return proc
 
     return proc
 
